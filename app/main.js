@@ -11,6 +11,7 @@ let hasAutoConnectedLocal = false;
 
 let isDeviceConnected = false;
 let isPipelineRunning = false; 
+let connectionTimeout = null;
 let monitorTimer = null;   
 let monitoringElapsedTimer = null;
 let monitoringStartedAt = null;
@@ -33,7 +34,6 @@ let detectedFanRpms = [];
 let detectedFanDuty = [];
 const fanDutyUserEdited = new Set();
 let fanControlRenderedCount = -1;
-let fanReadbackActive = false;
 let latestSocTemp = null;
 let latestTcc = 0;
 let latestProchot = 0;
@@ -75,6 +75,10 @@ let thermalJsonPreviewOnly = false;
 let autoTuneDryRun = null;
 let autoTuneResult = null;
 let thermalTuneSamples = [];
+let thermalTuneFirstSampleAt = null;
+let thermalTunePeaks = {};
+let thermalTuneLatest = {};
+let thermalTuneTrigger = null;
 let thermalTuneTriggered = false;
 let thermalTuneAverages = {};
 
@@ -840,6 +844,23 @@ function connectDevice() {
     
     const consoleBox = document.getElementById('console');
     consoleBox.innerText = `[TPTS] [1/2] Resetting ADB interface. Disconnecting ${ip}...\n`;
+
+    if (connectionTimeout !== null) clearTimeout(connectionTimeout);
+    connectionTimeout = setTimeout(() => {
+        connectionTimeout = null;
+        if (isDeviceConnected) return;
+        const statusEl = document.getElementById('link-status');
+        if (statusEl) {
+            statusEl.innerText = '[Connection Failed]';
+            statusEl.style.color = '#ff6672';
+        }
+        const statusDot = document.querySelector('.status-dot');
+        if (statusDot) {
+            statusDot.style.background = '#ff6672';
+            statusDot.style.boxShadow = 'none';
+        }
+        appendConsole(`[TPTS] Connection to ${ip} timed out after 10 seconds.`);
+    }, 10000);
     
     if (isLocalTarget(ip)) {
         sendAdb(['disconnect', ip]);
@@ -859,6 +880,31 @@ function connectDevice() {
 }
 
 function resetLiveDeviceState() {
+    isDeviceConnected = false;
+    deviceProductName = '';
+    devicePlatformName = '';
+    if (monitorTimer !== null) {
+        clearInterval(monitorTimer);
+        monitorTimer = null;
+    }
+    telemetrySampler = null;
+    syncConnectionUi();
+
+    const statusEl = document.getElementById('link-status');
+    if (statusEl) {
+        statusEl.innerText = '[Connecting]';
+        statusEl.style.color = '#ffaa00';
+    }
+    const statusDot = document.querySelector('.status-dot');
+    if (statusDot) {
+        statusDot.style.background = '#ffaa00';
+        statusDot.style.boxShadow = 'none';
+    }
+    const platformEl = document.getElementById('v-platform');
+    if (platformEl) platformEl.innerText = '--';
+    const productEl = document.getElementById('v-product');
+    if (productEl) productEl.innerText = '--';
+
     latestPackagePower = null;
     latestPl1 = null;
     latestPl2 = null;
@@ -1081,10 +1127,18 @@ function startPipelineCountdown(seconds) {
         pipelineCountdownRemaining -= 1;
         if (pipelineCountdownRemaining <= 0) {
             pipelineCountdownRemaining = 0;
-            renderPipelineCountdown();
             clearInterval(pipelineCountdownTimer);
             pipelineCountdownTimer = null;
-            if (isPipelineRunning) restoreAllUiToIdle();
+            const countdownEl = document.getElementById('pipeline-countdown');
+            if (countdownEl) {
+                countdownEl.innerText = 'Finalizing results...';
+                countdownEl.style.color = '#ffaa00';
+            }
+            if (autoTuneDryRun) {
+                const statusEl = document.getElementById('auto-tune-status');
+                if (statusEl) statusEl.innerText = 'Test duration reached. Waiting for the final device sample and preparing results...';
+                appendConsole('[Thermal Tune] Test duration reached. Finalizing results...');
+            }
             return;
         }
         renderPipelineCountdown();
@@ -1112,6 +1166,13 @@ function lockGlobalUiForPipeline() {
         runBtn.disabled = false; runBtn.style.opacity = "1.0"; runBtn.style.cursor = "pointer";
         runBtn.innerText = "Stop Stress Test";
         runBtn.style.background = "#ff4444"; runBtn.style.color = "#ffffff";
+    }
+
+    const copyLogBtn = document.querySelector('button[onclick="copyLog(this)"]');
+    if (copyLogBtn) {
+        copyLogBtn.disabled = false;
+        copyLogBtn.style.opacity = "1.0";
+        copyLogBtn.style.cursor = "pointer";
     }
 }
 
@@ -1205,10 +1266,10 @@ function startThermalPipeline() {
     } else {
         wasMonitoringBeforePipeline = false;
     }
+    telemetrySampler = null;
 
     lockGlobalUiForPipeline();
-    thermalTuneSamples = [];
-    thermalTuneTriggered = false;
+    resetThermalTuneTracking();
     chartingActive = true;
     if (!wasMonitoringBeforePipeline) {
         clearTemperatureHistories();
@@ -1228,14 +1289,10 @@ function startThermalPipeline() {
     const sec = durationEl ? durationEl.value : "60";
     const fishCountInput = document.getElementById('aquarium-fish-count');
     const fishCount = fishCountInput?.value || "30000";
-    if (workloads.includes('aquarium') && (!/^\d+$/.test(fishCount) || Number(fishCount) < 1 || Number(fishCount) > 30000)) {
+    if (workloads.includes('aquarium') && (!/^\d+$/.test(fishCount) || Number(fishCount) < 1)) {
         restoreAllUiToIdle();
-        return alert('Fish count must be an integer from 1 to 30,000.');
+        return alert('Fish count must be a positive integer.');
     }
-    // Keep dashboard sampling independent from workload/browser startup. The stress
-    // script can take several seconds to begin producing stdout, but charts should
-    // continue receiving one telemetry sample per second immediately.
-    startLiveTelemetryLoop();
     startPipelineCountdown(sec);
     
     document.getElementById('console').innerHTML += `\n[TPTS Pipeline] Starting: ${workloads.join(', ')} (${sec}s).\n`;
@@ -1360,13 +1417,27 @@ function buildThermalTuneReference(trigger) {
     };
 }
 
+function resetThermalTuneTracking() {
+    thermalTuneSamples = [];
+    thermalTuneFirstSampleAt = null;
+    thermalTunePeaks = {};
+    thermalTuneLatest = {};
+    thermalTuneTrigger = null;
+    thermalTuneTriggered = false;
+}
+
 function evaluateThermalTuneGuard() {
-    if (!isPipelineRunning || !autoTuneDryRun || thermalTuneTriggered) return;
+    if (!isPipelineRunning || !autoTuneDryRun) return;
     const sources = readThermalTuneSources();
     if (!Object.keys(sources).length) return;
-    thermalTuneSamples.push({ at: Date.now(), values: sources });
-    const windowSeconds = getThermalTuneSocWindowSeconds();
     const now = Date.now();
+    Object.entries(sources).forEach(([sensor, value]) => {
+        thermalTuneLatest[sensor] = value;
+        thermalTunePeaks[sensor] = Math.max(thermalTunePeaks[sensor] ?? -Infinity, value);
+    });
+    if (thermalTuneFirstSampleAt === null) thermalTuneFirstSampleAt = now;
+    thermalTuneSamples.push({ at: now, values: sources });
+    const windowSeconds = getThermalTuneSocWindowSeconds();
     const cutoff = now - windowSeconds * 1000;
     thermalTuneSamples = thermalTuneSamples.filter((sample) => sample.at >= cutoff);
     const thresholds = getThermalTuneThresholds();
@@ -1375,11 +1446,13 @@ function evaluateThermalTuneGuard() {
     if (!Number.isFinite(currentPl1) || !Number.isFinite(step)) return;
     const averages = {};
     const socValues = thermalTuneSamples.map((sample) => sample.values.soc).filter(Number.isFinite);
-    const socWindowReady = thermalTuneSamples.length > 1 && (now - thermalTuneSamples[0].at) >= windowSeconds * 1000;
+    // Filtered samples never span the full window, so readiness is measured from the first sample.
+    const socWindowReady = thermalTuneSamples.length > 1 && (now - thermalTuneFirstSampleAt) >= windowSeconds * 1000;
     if (socWindowReady && socValues.length) averages.soc = average(socValues);
     if (Number.isFinite(sources.tsr0)) averages.tsr0 = sources.tsr0;
     if (Number.isFinite(sources.tsr1)) averages.tsr1 = sources.tsr1;
     thermalTuneAverages = averages;
+    if (thermalTuneTriggered) return;
     const trigger = Object.entries(averages).find(([sensor, value]) => Number.isFinite(thresholds[sensor]) && value >= thresholds[sensor]);
     if (!trigger) return;
     const [triggeredSensor, averageTemperature] = trigger;
@@ -1391,6 +1464,16 @@ function evaluateThermalTuneGuard() {
         pl1Input.dataset.userEdited = '1';
     }
     thermalTuneTriggered = true;
+    thermalTuneTrigger = {
+        sensor: triggeredSensor,
+        value: averageTemperature,
+        limit: target,
+        elapsedSec: Math.max(0, Math.round((now - autoTuneDryRun.startedAt) / 1000)),
+        pl1Before: currentPl1,
+        pl1After: nextPl1,
+        socAtTrigger: sources.soc ?? null,
+        fanAtTrigger: detectedFanRpms[0] ?? null
+    };
     applyPowerLimits();
     autoTuneResult = buildThermalTuneReference({ sensor: triggeredSensor, averageC: averageTemperature, thresholdC: target });
     appendConsole(`[Thermal Tune] ${triggeredSensor} 5s average ${averageTemperature.toFixed(1)} C reached limit ${target} C. PL1 reduced from ${currentPl1.toFixed(3)} W to ${nextPl1.toFixed(3)} W.`);
@@ -1402,26 +1485,81 @@ function formatTuneValue(value, digits = 1, suffix = '') {
     return Number.isFinite(value) ? `${value.toFixed(digits)}${suffix}` : '--';
 }
 
-function renderThermalTuneResult(averages, triggeredSensor = null) {
+function escapeHtml(text) {
+    return `${text}`.replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+}
+
+function renderThermalTuneResult(session, trigger) {
     const resultEl = document.getElementById('auto-tune-result');
     const summaryEl = document.getElementById('auto-tune-summary');
     const stateEl = document.getElementById('auto-tune-result-state');
     if (!resultEl || !summaryEl || !stateEl) return;
     const thresholds = getThermalTuneThresholds();
-    const lines = [`Thermal results (SOC ${getThermalTuneSocWindowSeconds()}s average; TSR0/TSR1 current):`];
-    ['soc', 'tsr0', 'tsr1'].forEach((sensor) => {
-        const averageValue = averages[sensor];
-        const limit = thresholds[sensor];
-        const mode = sensor === 'soc' ? 'avg' : 'now';
-        const state = Number.isFinite(averageValue) ? (averageValue >= limit ? 'OVER' : 'OK') : 'NO DATA';
-        lines.push(`${sensor.toUpperCase()} (${mode}): ${formatTuneValue(averageValue, 1, ' °C')} / limit ${formatTuneValue(limit, 1, ' °C')} ${state}`);
-    });
+    const windowSeconds = getThermalTuneSocWindowSeconds();
     const currentPl1 = Number(document.getElementById('tune-pl1')?.value);
-    lines.push(`PL1 now: ${formatTuneValue(currentPl1, 3, ' W')}`);
-    lines.push(triggeredSensor ? `Triggered by: ${triggeredSensor.toUpperCase()}` : 'No sensor exceeded its limit.');
+    const html = [];
+    const line = (text, cls = '') => html.push(cls ? `<span class="${cls}">${escapeHtml(text)}</span>` : escapeHtml(text));
+
+    const startedAt = new Date(session.startedAt);
+    const workloads = (session.workloads || []).join(' + ') || 'unknown';
+    const startedText = startedAt.toLocaleString('en-US', { year: 'numeric', month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+    line(`Test: ${workloads} (${session.duration}s) · ${startedText}`, 'tune-muted');
+    if (trigger) {
+        const mode = trigger.sensor === 'soc' ? `${windowSeconds}s avg` : 'now';
+        line(`Trigger: ${trigger.sensor.toUpperCase()} ${mode} ${formatTuneValue(trigger.value, 1, ' °C')} ≥ ${formatTuneValue(trigger.limit, 1, ' °C')} at ${trigger.elapsedSec}s`, 'tune-over');
+        line(`Action: PL1 ${formatTuneValue(trigger.pl1Before, 3, ' W')} → ${formatTuneValue(trigger.pl1After, 3, ' W')}`, 'tune-action');
+    } else {
+        line('Trigger: none — no sensor exceeded its limit', 'tune-ok');
+        line(`PL1: ${formatTuneValue(currentPl1, 3, ' W')} (unchanged)`);
+    }
+    html.push('');
+
+    const col = (text, width) => `${text}`.padEnd(width);
+    line(`${col('Sensor', 8)}${col('Peak', 10)}${col('Final', 10)}${col('Limit', 10)}Status`, 'tune-muted');
+    ['soc', 'tsr0', 'tsr1'].forEach((sensor) => {
+        const peak = thermalTunePeaks[sensor];
+        const final = thermalTuneLatest[sensor];
+        const limit = thresholds[sensor];
+        let status;
+        let cls = '';
+        if (!Number.isFinite(peak)) {
+            status = 'NO DATA';
+            cls = 'tune-muted';
+        } else if (trigger && trigger.sensor === sensor) {
+            status = sensor === 'soc' ? `OVER (${windowSeconds}s avg)` : 'OVER';
+            cls = 'tune-over';
+        } else if (peak >= limit) {
+            status = sensor === 'soc' ? 'PEAK > LIMIT (avg OK)' : 'PEAK > LIMIT';
+            cls = 'tune-warn';
+        } else {
+            status = 'OK';
+            cls = 'tune-ok';
+        }
+        line(`${col(sensor.toUpperCase(), 8)}${col(formatTuneValue(peak, 1, ' °C'), 10)}${col(formatTuneValue(final, 1, ' °C'), 10)}${col(formatTuneValue(limit, 1, ' °C'), 10)}${status}`, cls);
+    });
+    html.push('');
+
+    if (trigger) {
+        const socNow = thermalTuneLatest.soc;
+        const fanNow = detectedFanRpms[0];
+        const socPart = Number.isFinite(trigger.socAtTrigger) && Number.isFinite(socNow)
+            ? `SOC ${formatTuneValue(trigger.socAtTrigger, 1)} → ${formatTuneValue(socNow, 1, ' °C')}`
+            : 'SOC trend unavailable';
+        const fanPart = Number.isFinite(trigger.fanAtTrigger) && Number.isFinite(fanNow)
+            ? ` (fan ${trigger.fanAtTrigger} → ${fanNow} RPM)`
+            : '';
+        line(`After reduction: ${socPart}${fanPart}`);
+        const recovered = Number.isFinite(socNow) && socNow < trigger.limit;
+        line(recovered
+            ? `Next step: Re-test at ${formatTuneValue(trigger.pl1After, 3, ' W')} to verify.`
+            : `Next step: Still over limit. Lower PL1 and re-test.`, 'tune-muted');
+    } else {
+        line(`Next step: ${formatTuneValue(currentPl1, 3, ' W')} passed. Run longer to confirm.`, 'tune-muted');
+    }
+
     resultEl.hidden = false;
-    stateEl.innerText = triggeredSensor ? 'Power reduced' : 'Completed';
-    summaryEl.innerText = lines.join('\n');
+    stateEl.innerText = trigger ? 'Power reduced' : 'Completed';
+    summaryEl.innerHTML = html.join('\n');
 }
 
 function updateAutoTuneObjectiveHint() {
@@ -1447,8 +1585,7 @@ function startAutoTuneDryRun() {
     autoTuneResult = null;
     const downloadButton = document.getElementById('auto-tune-download');
     if (downloadButton) downloadButton.title = 'Available after Thermal Tune generates a reference JSON.';
-    thermalTuneSamples = [];
-    thermalTuneTriggered = false;
+    resetThermalTuneTracking();
     thermalTuneAverages = {};
     const resultEl = document.getElementById('auto-tune-result');
     const summaryEl = document.getElementById('auto-tune-summary');
@@ -1513,10 +1650,7 @@ function finishLegacyAutoTuneDryRun() {
 function finishAutoTuneDryRun() {
     if (!autoTuneDryRun) return;
     const statusEl = document.getElementById('auto-tune-status');
-    const triggeredSensor = thermalTuneTriggered
-        ? Object.keys(thermalTuneAverages).find((sensor) => thermalTuneAverages[sensor] >= autoTuneDryRun.thresholds[sensor])
-        : null;
-    renderThermalTuneResult(thermalTuneAverages, triggeredSensor);
+    renderThermalTuneResult(autoTuneDryRun, thermalTuneTrigger);
     if (statusEl) statusEl.innerText = thermalTuneTriggered
         ? 'Thermal tune completed. Download the generated reference JSON for review.'
         : 'Tune ended without any sensor exceeding its 5-second average limit.';
@@ -1737,10 +1871,7 @@ function initChart() {
         }
         const relX = mouseX - paddingLeft;
         const stepX = chartWidth / (maxDataPoints - 1);
-        const sampleOffset = Math.max(0, maxDataPoints - tempHistory.length);
-        hoveredIndex = Math.round(relX / stepX) - sampleOffset;
-        if (hoveredIndex < 0) hoveredIndex = 0;
-        if (hoveredIndex >= tempHistory.length) hoveredIndex = tempHistory.length - 1;
+        hoveredIndex = Math.max(0, Math.min(maxDataPoints - 1, Math.round(relX / stepX)));
         redrawChart();
     });
     
@@ -1822,11 +1953,15 @@ function redrawChart() {
         ctx.stroke();
     });
 
-    const hoveredSeries = series.find((item) => item.values[hoveredIndex] != null) || series[0];
-    if (hoveredIndex >= 0 && hoveredIndex < hoveredSeries.values.length) {
-        const hoveredX = paddingLeft + (maxDataPoints - hoveredSeries.values.length + hoveredIndex) * stepX;
-        const hoveredY = paddingTop + chartHeight - (hoveredSeries.values[hoveredIndex] * (chartHeight / 100));
-        
+    if (hoveredIndex >= 0) {
+        const hoverSeries = series.map((item) => {
+            const valueIndex = hoveredIndex - (maxDataPoints - item.values.length);
+            const value = valueIndex >= 0 && valueIndex < item.values.length ? item.values[valueIndex] : null;
+            return { ...item, value };
+        }).filter((item) => item.value != null);
+        if (!hoverSeries.length) return;
+        const hoveredX = paddingLeft + hoveredIndex * stepX;
+
         ctx.strokeStyle = '#ffaa00';
         ctx.lineWidth = 2;
         ctx.setLineDash([4, 4]);
@@ -1835,32 +1970,37 @@ function redrawChart() {
         ctx.lineTo(hoveredX, canvasDisplayHeight - paddingBottom);
         ctx.stroke();
         ctx.setLineDash([]);
-        
-        ctx.beginPath();
-        ctx.arc(hoveredX, hoveredY, 5, 0, 2 * Math.PI);
-        ctx.fillStyle = '#ffaa00';
-        ctx.fill();
-        ctx.strokeStyle = '#ffffff';
-        ctx.lineWidth = 2;
-        ctx.stroke();
-        
-        const tooltipText = `${hoveredSeries.label} ${hoveredSeries.values[hoveredIndex]}°C`;
+
+        hoverSeries.forEach((item) => {
+            const hoveredY = paddingTop + chartHeight - item.value * (chartHeight / 100);
+            ctx.beginPath();
+            ctx.arc(hoveredX, hoveredY, 5, 0, 2 * Math.PI);
+            ctx.fillStyle = item.color;
+            ctx.fill();
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+        });
+
+        const tooltipLines = hoverSeries.map((item) => ({ text: `${item.label} ${Number(item.value).toFixed(1)}°C`, color: item.color }));
         ctx.font = 'bold 12px monospace';
         ctx.textAlign = 'center';
-        const textWidth = ctx.measureText(tooltipText).width;
+        const textWidth = Math.max(...tooltipLines.map((line) => ctx.measureText(line.text).width), 0);
         const tooltipX = hoveredX;
-        const tooltipY = hoveredY - 25;
+        const tooltipY = paddingTop + 16;
         const boxPadding = 6;
-        const boxHeight = 20;
-        
+        const boxHeight = tooltipLines.length * 14 + boxPadding * 2;
+
         ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
         ctx.fillRect(tooltipX - textWidth / 2 - boxPadding, tooltipY - 12 - boxPadding, textWidth + boxPadding * 2, boxHeight);
         ctx.strokeStyle = '#ffaa00';
         ctx.lineWidth = 1;
         ctx.strokeRect(tooltipX - textWidth / 2 - boxPadding, tooltipY - 12 - boxPadding, textWidth + boxPadding * 2, boxHeight);
-        
-        ctx.fillStyle = '#ffaa00';
-        ctx.fillText(tooltipText, tooltipX, tooltipY);
+
+        tooltipLines.forEach((line, index) => {
+            ctx.fillStyle = line.color;
+            ctx.fillText(line.text, tooltipX, tooltipY + index * 14);
+        });
     }
 }
 
@@ -2344,13 +2484,11 @@ socket.onmessage = (event) => {
             detectedFanRpms = Array.from({ length: detectedFanCount }, (_, index) => detectedFanRpms[index] ?? null);
             renderFanSpeeds();
         }
-        if (rawLog.includes('TPTS_FAN_BEGIN')) fanReadbackActive = true;
         const isFanLike = /Number of fans|Fan\s+\d+\s+RPM|pwm(get|set)|fanduty|autofanctrl|unrecognized subcommand/i.test(rawLog);
-        if ((fanReadbackActive || isFanLike) && !rawLog.includes('TPTS_SAMPLE')) {
+        if (isFanLike && !rawLog.includes('TPTS_SAMPLE')) {
             const cleaned = rawLog.replace(/TPTS_FAN_(BEGIN|END)/g, '').trim();
             if (cleaned) appendConsole(`[Fan] ${cleaned}`);
         }
-        if (rawLog.includes('TPTS_FAN_END')) fanReadbackActive = false;
         for (const rawFanMatch of rawLog.matchAll(/Fan\s+(\d+)\s+RPM:\s*(\d+)/gi)) {
             const fanIndex = parseInt(rawFanMatch[1], 10);
             detectedFanRpms[fanIndex] = parseInt(rawFanMatch[2], 10);
@@ -2479,7 +2617,8 @@ socket.onmessage = (event) => {
             pendingStructuredTemperature = null;
             awaitingStructuredSampleEnd = false;
         }
-        if (isPipelineRunning) evaluateThermalTuneGuard();
+        const stressSampleComplete = /^PKG_POWER_MW:\s*\d+/i.test(rawLog.trim());
+        if (isPipelineRunning && stressSampleComplete) evaluateThermalTuneGuard();
         if (chartingActive && Date.now() >= telemetryHistoryReadyAt && (discoveredTemp !== null || rawLog.includes('TPTS_SAMPLE:'))) {
             recordTelemetrySample();
         }
@@ -2524,6 +2663,10 @@ socket.onmessage = (event) => {
         }
 
         if (lowOutput.includes("connected to") || lowOutput.includes("already connected")) {
+            if (connectionTimeout !== null) {
+                clearTimeout(connectionTimeout);
+                connectionTimeout = null;
+            }
             isDeviceConnected = true;
             syncConnectionUi();
             resetTuningDefaultSyncState();

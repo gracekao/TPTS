@@ -191,12 +191,12 @@ else
 fi
 echo "[4/4] Recording telemetry metrics dynamically..."
 
-ELAPSED=0
-while [ $ELAPSED -lt "$DURATION_SEC" ]; do
+END_TIME=$((SECONDS + DURATION_SEC))
+while [ $SECONDS -lt $END_TIME ]; do
     run_telemetry_tick
     echo -e "\n"
+    [ $SECONDS -ge $END_TIME ] && break
     sleep 1
-    ELAPSED=$((ELAPSED + 1))
 done
 
 [ -n "$STRESS_PID" ] && kill -9 "$STRESS_PID" >/dev/null 2>&1
