@@ -71,7 +71,9 @@ Thermal Tune uses the following user-defined limits:
 - **TSR0 Temperature Limit**: TSR0 uses its current reading. PL1 reduction starts when the reading exceeds the TSR0 limit.
 - **TSR1 Temperature Limit**: TSR1 uses its current reading. PL1 reduction starts when the reading exceeds the TSR1 limit.
 
-When any configured limit is exceeded, TPTS reduces PL1 first. After the test finishes, TPTS generates a reference JSON based on the connected device's default thermal JSON. The user can download the generated JSON or apply it after reviewing the confirmation warning.
+Auto Tune uses `ectool autofanctrl` before it starts, so the EC remains the sole fan governor. It uses the configured SOC averaging period as its temperature reference, while TSR0/TSR1, TCC, and PROCHOT remain immediate protection inputs. When a limit is exceeded, TPTS reduces PL1 by the configured step, waits for the recovery hold period, and only restores one PL1 step after all available sensors stay below their limits with a 2 C hysteresis margin. PL1 never rises above the user-selected starting value or below the configured minimum.
+
+Auto Tune does not modify `thermal_info_config.json`. On completion it exports a power profile containing the temperature limits, SOC averaging period, EC fan mode, final PL limits, and each PL1 adjustment. Thermal HAL JSON editing remains a separate, manual workflow.
 
 Fan control is represented through thermal HAL cooling-device votes such as `CdevRequest`, `BindedCdevInfo`, and `LimitInfo`; these values are cooling-device states, not direct fan RPM values. The actual fan behavior depends on the device's thermal driver and `WritePath` mapping.
 
@@ -82,6 +84,7 @@ TPTS collects the following data from the connected Android device. Live Monitor
 | Dashboard data | Primary source | Fallback / calculation | Unit | Used by |
 | --- | --- | --- | --- | --- |
 | Package Power | `/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj` | Delta between samples. If unavailable: MSR `0x611` (package energy status) using energy unit from MSR `0x606`. | mW / W | Package Power card, live power chart, CSV log |
+| IA / GT Power | Live Monitor and stress sampling read RAPL child domains named `core`/`pp0` and `gt`/`graphics`/`pp1`; if a domain is unavailable, they read MSR `0x639` (IA/PP0) or `0x641` (GT/PP1), using the energy unit from `0x606`. | Unavailable (`-- W`) when neither source exposes the domain. `uncore` is not assumed to be GT. These domains do not necessarily sum to Package Power. | W | Optional IA / GT cards and power chart |
 | SoC Temp | Thermal zone whose `type` is `x86_pkg_temp` | `thermal_zone0/temp`, then MSR `0x19C` digital temperature sensor; final safety value is 42 C when no usable source exists. | C | SoC Temp card, temperature chart, CSV log |
 | Thermal-zone temperatures | `/sys/class/thermal/thermal_zone*/temp` and matching `type` | None; zones are shown when readable. Raw values above 1000 are converted from millidegrees C for display. | C | Optional thermal-zone cards and temperature chart |
 | CPU frequency | `/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq` | None | kHz, displayed as GHz | CPU Freq card and CSV log |

@@ -81,6 +81,8 @@ let thermalTuneLatest = {};
 let thermalTuneTrigger = null;
 let thermalTuneTriggered = false;
 let thermalTuneAverages = {};
+let thermalTuneStableSince = null;
+let thermalTuneLastAdjustmentAt = null;
 
 // 🌊【移動平均快取】：供 Canvas 繪圖平滑化使用
 const filterWindow = [];
@@ -1267,6 +1269,13 @@ function startThermalPipeline() {
         wasMonitoringBeforePipeline = false;
     }
     telemetrySampler = null;
+    namedRaplActive = false;
+    latestIaPower = null;
+    latestGtPower = null;
+    for (const id of ['v-ia-power', 'v-gt-power']) {
+        const element = document.getElementById(id);
+        if (element) element.innerText = '-- W';
+    }
 
     lockGlobalUiForPipeline();
     resetThermalTuneTracking();
@@ -1424,6 +1433,42 @@ function resetThermalTuneTracking() {
     thermalTuneLatest = {};
     thermalTuneTrigger = null;
     thermalTuneTriggered = false;
+    thermalTuneStableSince = null;
+    thermalTuneLastAdjustmentAt = null;
+}
+
+function getThermalTuneControlSettings() {
+    return {
+        stepWatts: Number(document.getElementById('auto-tune-pl1-step')?.value),
+        minimumPl1Watts: Number(document.getElementById('auto-tune-pl1-min')?.value),
+        settleSeconds: Number(document.getElementById('auto-tune-settle-seconds')?.value) || 15,
+        hysteresisCelsius: 2
+    };
+}
+
+function adjustThermalTunePl1(nextPl1, reason, sources, now) {
+    const pl1Input = document.getElementById('tune-pl1');
+    const currentPl1 = Number(pl1Input?.value);
+    if (!pl1Input || !Number.isFinite(currentPl1) || Math.abs(nextPl1 - currentPl1) < 0.001) return false;
+
+    pl1Input.value = formatPowerWatts(nextPl1);
+    pl1Input.dataset.userEdited = '1';
+    thermalTuneTriggered = true;
+    thermalTuneLastAdjustmentAt = now;
+    thermalTuneStableSince = null;
+    const adjustment = {
+        reason,
+        atSeconds: Math.max(0, Math.round((now - autoTuneDryRun.startedAt) / 1000)),
+        pl1Before: currentPl1,
+        pl1After: nextPl1,
+        soc: sources.soc ?? null,
+        fanRpm: detectedFanRpms[0] ?? null
+    };
+    autoTuneDryRun.adjustments.push(adjustment);
+    thermalTuneTrigger = adjustment;
+    applyPowerLimits();
+    appendConsole(`[Auto Tune] ${reason}: PL1 ${currentPl1.toFixed(3)} W -> ${nextPl1.toFixed(3)} W.`);
+    return true;
 }
 
 function evaluateThermalTuneGuard() {
@@ -1441,9 +1486,9 @@ function evaluateThermalTuneGuard() {
     const cutoff = now - windowSeconds * 1000;
     thermalTuneSamples = thermalTuneSamples.filter((sample) => sample.at >= cutoff);
     const thresholds = getThermalTuneThresholds();
-    const step = Number(document.getElementById('auto-tune-pl1-step')?.value);
+    const control = getThermalTuneControlSettings();
     const currentPl1 = Number(document.getElementById('tune-pl1')?.value);
-    if (!Number.isFinite(currentPl1) || !Number.isFinite(step)) return;
+    if (!Number.isFinite(currentPl1) || !Number.isFinite(control.stepWatts) || !Number.isFinite(control.minimumPl1Watts)) return;
     const averages = {};
     const socValues = thermalTuneSamples.map((sample) => sample.values.soc).filter(Number.isFinite);
     // Filtered samples never span the full window, so readiness is measured from the first sample.
@@ -1452,33 +1497,37 @@ function evaluateThermalTuneGuard() {
     if (Number.isFinite(sources.tsr0)) averages.tsr0 = sources.tsr0;
     if (Number.isFinite(sources.tsr1)) averages.tsr1 = sources.tsr1;
     thermalTuneAverages = averages;
-    if (thermalTuneTriggered) return;
     const trigger = Object.entries(averages).find(([sensor, value]) => Number.isFinite(thresholds[sensor]) && value >= thresholds[sensor]);
-    if (!trigger) return;
-    const [triggeredSensor, averageTemperature] = trigger;
-    const target = thresholds[triggeredSensor];
-    const nextPl1 = Math.max(0.125, Math.round((currentPl1 - step) / 0.125) * 0.125);
-    const pl1Input = document.getElementById('tune-pl1');
-    if (pl1Input) {
-        pl1Input.value = formatPowerWatts(nextPl1);
-        pl1Input.dataset.userEdited = '1';
-    }
-    thermalTuneTriggered = true;
-    thermalTuneTrigger = {
-        sensor: triggeredSensor,
-        value: averageTemperature,
-        limit: target,
-        elapsedSec: Math.max(0, Math.round((now - autoTuneDryRun.startedAt) / 1000)),
-        pl1Before: currentPl1,
-        pl1After: nextPl1,
-        socAtTrigger: sources.soc ?? null,
-        fanAtTrigger: detectedFanRpms[0] ?? null
-    };
-    applyPowerLimits();
-    autoTuneResult = buildThermalTuneReference({ sensor: triggeredSensor, averageC: averageTemperature, thresholdC: target });
-    appendConsole(`[Thermal Tune] ${triggeredSensor} 5s average ${averageTemperature.toFixed(1)} C reached limit ${target} C. PL1 reduced from ${currentPl1.toFixed(3)} W to ${nextPl1.toFixed(3)} W.`);
     const statusEl = document.getElementById('auto-tune-status');
-    if (statusEl) statusEl.innerText = 'Thermal tune is running. SOC uses its average window; TSR0/TSR1 use current values.';
+    const cooldownElapsed = thermalTuneLastAdjustmentAt === null || now - thermalTuneLastAdjustmentAt >= control.settleSeconds * 1000;
+    const emergency = latestTcc || latestProchot;
+    if ((trigger || emergency) && cooldownElapsed) {
+        const reason = emergency
+            ? (latestProchot ? 'PROCHOT protection' : 'TCC thermal throttle')
+            : `${trigger[0].toUpperCase()} ${trigger[0] === 'soc' ? `${windowSeconds}s average` : 'temperature'} reached ${thresholds[trigger[0]].toFixed(1)} C`;
+        const nextPl1 = Math.max(control.minimumPl1Watts, Math.round((currentPl1 - control.stepWatts) / 0.125) * 0.125);
+        adjustThermalTunePl1(nextPl1, reason, sources, now);
+        if (statusEl) statusEl.innerText = `Auto Tune reduced PL1 after ${reason}. EC fan control remains automatic.`;
+        return;
+    }
+
+    const availableSensors = Object.keys(averages).filter((sensor) => Number.isFinite(thresholds[sensor]));
+    const belowRecoveryBand = availableSensors.length > 0 && availableSensors.every((sensor) => averages[sensor] <= thresholds[sensor] - control.hysteresisCelsius);
+    if (!belowRecoveryBand || emergency) {
+        thermalTuneStableSince = null;
+        return;
+    }
+    if (thermalTuneStableSince === null) thermalTuneStableSince = now;
+    const stableForMs = now - thermalTuneStableSince;
+    const startingPl1 = autoTuneDryRun.startingPl1;
+    if (stableForMs >= control.settleSeconds * 1000 && cooldownElapsed && currentPl1 < startingPl1) {
+        const nextPl1 = Math.min(startingPl1, Math.round((currentPl1 + control.stepWatts) / 0.125) * 0.125);
+        adjustThermalTunePl1(nextPl1, `recovered below target for ${control.settleSeconds}s`, sources, now);
+        if (statusEl) statusEl.innerText = `Auto Tune restored PL1 one step after ${control.settleSeconds}s below the recovery band.`;
+    } else if (statusEl) {
+        const stableSeconds = Math.floor(stableForMs / 1000);
+        statusEl.innerText = `Auto Tune monitoring. SoC reference: ${windowSeconds}s average. Recovery hold: ${stableSeconds}/${control.settleSeconds}s.`;
+    }
 }
 
 function formatTuneValue(value, digits = 1, suffix = '') {
@@ -1505,11 +1554,12 @@ function renderThermalTuneResult(session, trigger) {
     const startedText = startedAt.toLocaleString('en-US', { year: 'numeric', month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
     line(`Test: ${workloads} (${session.duration}s) · ${startedText}`, 'tune-muted');
     if (trigger) {
-        const mode = trigger.sensor === 'soc' ? `${windowSeconds}s avg` : 'now';
-        line(`Trigger: ${trigger.sensor.toUpperCase()} ${mode} ${formatTuneValue(trigger.value, 1, ' °C')} ≥ ${formatTuneValue(trigger.limit, 1, ' °C')} at ${trigger.elapsedSec}s`, 'tune-over');
-        line(`Action: PL1 ${formatTuneValue(trigger.pl1Before, 3, ' W')} → ${formatTuneValue(trigger.pl1After, 3, ' W')}`, 'tune-action');
+        line(`PL1 adjustments: ${session.adjustments.length}`, 'tune-action');
+        session.adjustments.forEach((adjustment) => {
+            line(`${adjustment.atSeconds}s: ${adjustment.reason}; PL1 ${formatTuneValue(adjustment.pl1Before, 3, ' W')} -> ${formatTuneValue(adjustment.pl1After, 3, ' W')}`, 'tune-action');
+        });
     } else {
-        line('Trigger: none — no sensor exceeded its limit', 'tune-ok');
+        line('PL1 adjustments: none', 'tune-ok');
         line(`PL1: ${formatTuneValue(currentPl1, 3, ' W')} (unchanged)`);
     }
     html.push('');
@@ -1525,9 +1575,6 @@ function renderThermalTuneResult(session, trigger) {
         if (!Number.isFinite(peak)) {
             status = 'NO DATA';
             cls = 'tune-muted';
-        } else if (trigger && trigger.sensor === sensor) {
-            status = sensor === 'soc' ? `OVER (${windowSeconds}s avg)` : 'OVER';
-            cls = 'tune-over';
         } else if (peak >= limit) {
             status = sensor === 'soc' ? 'PEAK > LIMIT (avg OK)' : 'PEAK > LIMIT';
             cls = 'tune-warn';
@@ -1540,19 +1587,8 @@ function renderThermalTuneResult(session, trigger) {
     html.push('');
 
     if (trigger) {
-        const socNow = thermalTuneLatest.soc;
-        const fanNow = detectedFanRpms[0];
-        const socPart = Number.isFinite(trigger.socAtTrigger) && Number.isFinite(socNow)
-            ? `SOC ${formatTuneValue(trigger.socAtTrigger, 1)} → ${formatTuneValue(socNow, 1, ' °C')}`
-            : 'SOC trend unavailable';
-        const fanPart = Number.isFinite(trigger.fanAtTrigger) && Number.isFinite(fanNow)
-            ? ` (fan ${trigger.fanAtTrigger} → ${fanNow} RPM)`
-            : '';
-        line(`After reduction: ${socPart}${fanPart}`);
-        const recovered = Number.isFinite(socNow) && socNow < trigger.limit;
-        line(recovered
-            ? `Next step: Re-test at ${formatTuneValue(trigger.pl1After, 3, ' W')} to verify.`
-            : `Next step: Still over limit. Lower PL1 and re-test.`, 'tune-muted');
+        line(`Final PL1: ${formatTuneValue(currentPl1, 3, ' W')} · EC fan control: automatic`);
+        line(`SoC evaluation reference: ${windowSeconds}s average. Verify the profile with a longer workload before using it as a sustained limit.`, 'tune-muted');
     } else {
         line(`Next step: ${formatTuneValue(currentPl1, 3, ' W')} passed. Run longer to confirm.`, 'tune-muted');
     }
@@ -1578,10 +1614,17 @@ function startAutoTuneDryRun() {
     if (isPipelineRunning) return;
     const thresholds = getThermalTuneThresholds();
     if (Object.values(thresholds).some((value) => !Number.isFinite(value) || value < 1 || value > 120)) return alert('Set valid SOC, TSR0, and TSR1 temperature limits.');
+    const control = getThermalTuneControlSettings();
+    if (!Number.isFinite(control.stepWatts) || control.stepWatts < 0.125 || !Number.isFinite(control.minimumPl1Watts) || control.minimumPl1Watts < 0.125 || !Number.isFinite(control.settleSeconds) || control.settleSeconds < 5) return alert('Set valid Auto Tune PL1 step, minimum PL1, and recovery hold values.');
+    const pl1 = Number(document.getElementById('tune-pl1')?.value);
+    const pl2 = Number(document.getElementById('tune-pl2')?.value);
+    const pl4 = Number(document.getElementById('tune-pl4')?.value);
+    if (![pl1, pl2, pl4].every((value) => Number.isFinite(value) && value > 0)) return alert('Set PL1, PL2, and PL4 before starting Auto Tune.');
+    if (control.minimumPl1Watts > pl1) return alert('Minimum PL1 must not exceed the starting PL1.');
     const workloads = [...document.querySelectorAll('input[name="stress-workload"]:checked')].map((input) => input.value);
     if (!workloads.length) return alert('Select at least one stress workload.');
     const duration = Number(document.getElementById('duration')?.value || 60);
-    autoTuneDryRun = { thresholds, workloads, duration, startedAt: Date.now() };
+    autoTuneDryRun = { thresholds, workloads, duration, startedAt: Date.now(), startingPl1: pl1, adjustments: [] };
     autoTuneResult = null;
     const downloadButton = document.getElementById('auto-tune-download');
     if (downloadButton) downloadButton.title = 'Available after Thermal Tune generates a reference JSON.';
@@ -1593,9 +1636,13 @@ function startAutoTuneDryRun() {
     if (resultEl) resultEl.hidden = true;
     if (summaryEl) summaryEl.textContent = '';
     if (stateEl) stateEl.textContent = 'Running';
-    prefetchThermalJsonReference(getCurrentTarget());
+    const fanMode = document.getElementById('tune-fan-mode');
+    if (fanMode) {
+        fanMode.value = 'auto';
+        applyFanSettings();
+    }
     const statusEl = document.getElementById('auto-tune-status');
-    if (statusEl) statusEl.innerText = 'Thermal tune in progress. Each sensor uses its own 5-second average limit.';
+    if (statusEl) statusEl.innerText = `Auto Tune in progress. EC fan control is automatic; SoC uses a ${getThermalTuneSocWindowSeconds()}s average reference.`;
     startThermalPipeline();
 }
 
@@ -1650,10 +1697,23 @@ function finishLegacyAutoTuneDryRun() {
 function finishAutoTuneDryRun() {
     if (!autoTuneDryRun) return;
     const statusEl = document.getElementById('auto-tune-status');
+    const control = getThermalTuneControlSettings();
+    const finalPl1 = Number(document.getElementById('tune-pl1')?.value);
+    autoTuneResult = {
+        schemaVersion: 1,
+        profileName: `ec-auto-tune-${new Date().toISOString().replace(/[:.]/g, '-')}`,
+        source: 'tpts-ec-auto-tune',
+        fanControl: 'ectool autofanctrl',
+        limits: getThermalTuneThresholds(),
+        socAveragingPeriodSeconds: getThermalTuneSocWindowSeconds(),
+        recovery: { holdSeconds: control.settleSeconds, hysteresisCelsius: control.hysteresisCelsius },
+        power: { startingPl1Watts: autoTuneDryRun.startingPl1, finalPl1Watts: finalPl1, pl2Watts: Number(document.getElementById('tune-pl2')?.value), pl4Watts: Number(document.getElementById('tune-pl4')?.value) },
+        adjustments: autoTuneDryRun.adjustments
+    };
     renderThermalTuneResult(autoTuneDryRun, thermalTuneTrigger);
     if (statusEl) statusEl.innerText = thermalTuneTriggered
-        ? 'Thermal tune completed. Download the generated reference JSON for review.'
-        : 'Tune ended without any sensor exceeding its 5-second average limit.';
+        ? 'Auto Tune completed. Download the generated power profile for review.'
+        : `Auto Tune completed without PL1 changes. SoC used a ${getThermalTuneSocWindowSeconds()}s average reference.`;
     autoTuneDryRun = null;
 }
 
@@ -1795,6 +1855,22 @@ function startLiveTelemetryLoop(resetHistory = false) {
         if (!target) return;
         let megaCommand = `su 0 sh -c 'temp_value=; for z in /sys/class/thermal/thermal_zone*; do t=\$(cat \$z/type 2>/dev/null); if [ "\$t" = "x86_pkg_temp" ]; then temp_value=\$(cat \$z/temp 2>/dev/null); break; fi; done; if [ -z "\$temp_value" ] && [ -f /sys/class/thermal/thermal_zone0/temp ]; then temp_value=\$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null); fi; freq_value=; f=/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq; [ -f "\$f" ] && freq_value=\$(cat "\$f" 2>/dev/null); fan_count=\$(ectool pwmgetnumfans 2>/dev/null | sed -n "s/.*= *//p"); fan_values=; if [ -n "\$fan_count" ]; then fan_values=\$(ectool pwmgetfanrpm 2>/dev/null | sed -n "s/.*RPM: *//p" | tr "\\n" ","); else fan_count=0; for fan in /sys/class/hwmon/hwmon*/fan*_input; do if [ -f "\$fan" ]; then rpm=\$(cat "\$fan" 2>/dev/null); if [ -n "\$rpm" ]; then fan_values="\${fan_values:+\$fan_values,}\$rpm"; fan_count=\$((fan_count + 1)); fi; fi; done; fi; power_mw=; ia_mw=; gt_mw=; p=/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj; m=/sys/class/powercap/intel-rapl/intel-rapl:0/max_energy_range_uj; iap=/sys/class/powercap/intel-rapl/intel-rapl:0/intel-rapl:0:0/energy_uj; gtp=/sys/class/powercap/intel-rapl/intel-rapl:0/intel-rapl:0:1/energy_uj; if [ -f "\$p" ]; then e1=\$(cat "\$p" 2>/dev/null); ia1=; [ -f "\$iap" ] && ia1=\$(cat "\$iap" 2>/dev/null); gt1=; [ -f "\$gtp" ] && gt1=\$(cat "\$gtp" 2>/dev/null); sleep 1; e2=\$(cat "\$p" 2>/dev/null); ia2=; [ -f "\$iap" ] && ia2=\$(cat "\$iap" 2>/dev/null); gt2=; [ -f "\$gtp" ] && gt2=\$(cat "\$gtp" 2>/dev/null); if [ -n "\$e1" ] && [ -n "\$e2" ]; then d=\$((e2 - e1)); if [ \$d -lt 0 ]; then mx=\$(cat "\$m" 2>/dev/null); [ -n "\$mx" ] && d=\$((d + mx)); fi; power_mw=\$((d / 1000)); fi; if [ -n "\$ia1" ] && [ -n "\$ia2" ]; then dia=\$((ia2 - ia1)); [ \$dia -lt 0 ] && dia=0; ia_mw=\$((dia / 1000)); fi; if [ -n "\$gt1" ] && [ -n "\$gt2" ]; then dgt=\$((gt2 - gt1)); [ \$dgt -lt 0 ] && dgt=0; gt_mw=\$((dgt / 1000)); fi; fi; echo "TPTS_SAMPLE: TARGET_SYSFS_TEMP: \${temp_value:-NA} CPU_FREQ_KHZ: \${freq_value:-NA} FAN_COUNT: \${fan_count:-0} FAN_RPMS: \${fan_values:-NA} PKG_POWER_MW: \${power_mw:-NA} IA_MW: \${ia_mw:-NA} GT_MW: \${gt_mw:-NA} MSR_19C: \$(/data/local/tmp/iotools rdmsr 0 0x19C 2>/dev/null) MSR_610: \$(/data/local/tmp/iotools rdmsr 0 0x610 2>/dev/null) MSR_601: \$(/data/local/tmp/iotools rdmsr 0 0x601 2>/dev/null) MSR_64F: \$(/data/local/tmp/iotools rdmsr 0 0x64F 2>/dev/null) MSR_6B0: \$(/data/local/tmp/iotools rdmsr 0 0x6B0 2>/dev/null)"'`;
         const thermalZoneSampleSuffix = '; for z in /sys/class/thermal/thermal_zone*; do [ -d "$z" ] || continue; index=${z##*thermal_zone}; type=$(cat "$z/type" 2>/dev/null | tr "[:space:]" "_"); temp=$(cat "$z/temp" 2>/dev/null); [ -n "$type" ] && [ -n "$temp" ] && echo TPTS_THERMAL_ZONE: $index:$type:$temp; done; echo TPTS_SAMPLE_END';
+        megaCommand = megaCommand.replace(
+            'iap=/sys/class/powercap/intel-rapl/intel-rapl:0/intel-rapl:0:0/energy_uj; gtp=/sys/class/powercap/intel-rapl/intel-rapl:0/intel-rapl:0:1/energy_uj;',
+            'iap=; gtp=; for domain in /sys/class/powercap/intel-rapl/intel-rapl:0:*; do [ -f "$domain/energy_uj" ] || continue; domain_name=$(cat "$domain/name" 2>/dev/null); case "$domain_name" in core|pp0) iap="$domain/energy_uj" ;; gt|graphics|pp1) gtp="$domain/energy_uj" ;; esac; done;'
+        );
+        megaCommand = megaCommand.replace(
+            'sleep 1;',
+            'rapl_unit=; ia_msr_e1=; gt_msr_e1=; if [ -z "$ia1" ] || [ -z "$gt1" ]; then rapl_unit=$(/data/local/tmp/iotools rdmsr 0 0x606 2>/dev/null); fi; if [ -z "$ia1" ]; then ia_msr_e1=$(/data/local/tmp/iotools rdmsr 0 0x639 2>/dev/null); fi; if [ -z "$gt1" ]; then gt_msr_e1=$(/data/local/tmp/iotools rdmsr 0 0x641 2>/dev/null); fi; sleep 1;'
+        );
+        megaCommand = megaCommand.replace(
+            'gt2=$(cat "$gtp" 2>/dev/null);',
+            'gt2=$(cat "$gtp" 2>/dev/null); if [ -z "$ia2" ] && [ -n "$ia_msr_e1" ]; then ia_msr_e2=$(/data/local/tmp/iotools rdmsr 0 0x639 2>/dev/null); fi; if [ -z "$gt2" ] && [ -n "$gt_msr_e1" ]; then gt_msr_e2=$(/data/local/tmp/iotools rdmsr 0 0x641 2>/dev/null); fi;'
+        );
+        megaCommand = megaCommand.replace(
+            'fi; fi; echo "TPTS_SAMPLE:',
+            'fi; if [ -n "$ia_msr_e1" ] && [ -n "$ia_msr_e2" ] && [ -n "$rapl_unit" ]; then ia_count_1=$((ia_msr_e1 & 0xFFFFFFFF)); ia_count_2=$((ia_msr_e2 & 0xFFFFFFFF)); ia_delta=$((ia_count_2 - ia_count_1)); [ $ia_delta -lt 0 ] && ia_delta=$((ia_delta + 4294967296)); energy_unit=$(( (rapl_unit >> 8) & 0x1F )); ia_mw=$((ia_delta * 1000 / (1 << energy_unit))); fi; if [ -n "$gt_msr_e1" ] && [ -n "$gt_msr_e2" ] && [ -n "$rapl_unit" ]; then gt_count_1=$((gt_msr_e1 & 0xFFFFFFFF)); gt_count_2=$((gt_msr_e2 & 0xFFFFFFFF)); gt_delta=$((gt_count_2 - gt_count_1)); [ $gt_delta -lt 0 ] && gt_delta=$((gt_delta + 4294967296)); energy_unit=$(( (rapl_unit >> 8) & 0x1F )); gt_mw=$((gt_delta * 1000 / (1 << energy_unit))); fi; fi; echo "TPTS_SAMPLE:'
+        );
         megaCommand = megaCommand.replace(/'$/, `${thermalZoneSampleSuffix}'`);
         if (isLocalTarget(target)) {
             sendAdb(['shell', megaCommand]);
@@ -2466,17 +2542,25 @@ socket.onmessage = (event) => {
             const frequencyEl = document.getElementById('v-freq');
             if (frequencyEl) frequencyEl.innerText = `${latestCpuFreqGhz.toFixed(2)} GHz`;
         }
-        const iaMatch = rawLog.match(/IA_MW:\s*(\d+)/i);
+        const iaMatch = rawLog.match(/(?:^|\s)IA_MW:\s*(\d+|NA)\b/i);
         if (iaMatch) {
-            latestIaPower = parseInt(iaMatch[1], 10) / 1000;
+            latestIaPower = iaMatch[1] === 'NA' ? null : parseInt(iaMatch[1], 10) / 1000;
             const iaEl = document.getElementById('v-ia-power');
-            if (iaEl) iaEl.innerText = `${latestIaPower.toFixed(2)} W`;
+            if (iaEl) iaEl.innerText = latestIaPower === null ? '-- W' : `${latestIaPower.toFixed(2)} W`;
+            if (isPipelineRunning && iaPowerHistory.length) {
+                iaPowerHistory[iaPowerHistory.length - 1] = latestIaPower;
+                redrawPowerChart();
+            }
         }
-        const gtMatch = rawLog.match(/GT_MW:\s*(\d+)/i);
+        const gtMatch = rawLog.match(/(?:^|\s)GT_MW:\s*(\d+|NA)\b/i);
         if (gtMatch) {
-            latestGtPower = parseInt(gtMatch[1], 10) / 1000;
+            latestGtPower = gtMatch[1] === 'NA' ? null : parseInt(gtMatch[1], 10) / 1000;
             const gtEl = document.getElementById('v-gt-power');
-            if (gtEl) gtEl.innerText = `${latestGtPower.toFixed(2)} W`;
+            if (gtEl) gtEl.innerText = latestGtPower === null ? '-- W' : `${latestGtPower.toFixed(2)} W`;
+            if (isPipelineRunning && gtPowerHistory.length) {
+                gtPowerHistory[gtPowerHistory.length - 1] = latestGtPower;
+                redrawPowerChart();
+            }
         }
         const rawFanCountMatch = rawLog.match(/Number of fans\s*=\s*(\d+)/i);
         if (rawFanCountMatch) {

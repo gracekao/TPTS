@@ -212,9 +212,9 @@
                     <div class="section" id="tab-auto-tune">
                         <h4>⚙ Thermal Tune <span class="current-hint" style="margin-left:auto">Live control</span></h4>
                         <div class="auto-tune-inputs"><div class="form-group"><label>SOC Temperature Limit (°C)</label><input id="auto-tune-soc-target" type="number" value="85" min="1" max="120"></div><div class="form-group"><label>SOC Averaging Period (sec)</label><input id="auto-tune-soc-window" type="number" value="5" min="1" max="60" step="1"></div><div class="form-group"><label>TSR0 Temperature Limit (°C)</label><input id="auto-tune-tsr0-target" type="number" value="60" min="1" max="120"></div><div class="form-group"><label>TSR1 Temperature Limit (°C)</label><input id="auto-tune-tsr1-target" type="number" value="60" min="1" max="120"></div></div>
-                        <div class="auto-tune-inputs"><div class="form-group auto-tune-step"><label>PL1 reduction after trigger (W)</label><input id="auto-tune-pl1-step" type="number" value="1" min="0.125" max="20" step="0.125"></div></div>
+                        <div class="auto-tune-inputs"><div class="form-group"><label>PL1 Step (W)</label><input id="auto-tune-pl1-step" type="number" value="1" min="0.125" max="20" step="0.125"></div><div class="form-group"><label>Minimum PL1 (W)</label><input id="auto-tune-pl1-min" type="number" value="5" min="0.125" max="200" step="0.125"></div><div class="form-group auto-tune-step"><label>Recovery Hold (sec)</label><input id="auto-tune-settle-seconds" type="number" value="15" min="5" max="300" step="1"></div></div>
                         <div class="action-row"><button class="success-button" onclick="startAutoTuneDryRun()">Start Thermal Tune</button></div>
-                        <div class="thermal-json-status" id="auto-tune-status">Set the limits, then start Thermal Tune. A PL1 reduction and reference JSON are generated when a limit is exceeded.</div>
+                        <div class="thermal-json-status" id="auto-tune-status">Auto Tune uses EC automatic fan control. SoC is evaluated with the selected averaging period; PL1 changes in steps and recovers only after the recovery hold.</div>
                     </div>
                     <div class="section" id="tab-thermal-json">
                         <h4>🧩 Thermal JSON Configuration <span class="current-hint" style="margin-left:auto">Edit device JSON</span></h4>
@@ -262,7 +262,7 @@
                 </div>
                 <div class="panel" id="auto-tune-result" hidden>
                     <div class="panel-header"><h3 class="panel-title">⚙ Auto Tune Result</h3><span class="panel-note" id="auto-tune-result-state">Dry run</span></div>
-                    <div class="auto-tune-result"><pre class="auto-tune-summary" id="auto-tune-summary"></pre><div class="auto-tune-actions"><button class="secondary-button" onclick="exportAutoTuneProfile()">Download Thermal Tune JSON</button><button class="primary-button" onclick="applyAutoTuneReference()">Apply Thermal Tune JSON</button></div></div>
+                    <div class="auto-tune-result"><pre class="auto-tune-summary" id="auto-tune-summary"></pre><div class="auto-tune-actions"><button class="secondary-button" onclick="exportAutoTuneProfile()">Download Power Profile</button></div></div>
                 </div>
                 <div class="panel"><div class="panel-header"><h3 class="panel-title">› System Log</h3><button class="copy-log-btn" onclick="copyLog(this)" title="Copy Log">⧉ Copy</button></div><div id="console"></div></div>
             </section>

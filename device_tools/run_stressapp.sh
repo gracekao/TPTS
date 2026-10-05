@@ -18,6 +18,39 @@ LOG_FILE="/data/local/tmp/msr_log.csv"
 echo "Timestamp,MSR_0x610,MSR_0x64F,MSR_0x6B0,SoC_Temp_C,PKG_Power_W,Throttling_Flags" > "$LOG_FILE"
 PREV_RAPL_ENERGY=""
 RAPL_ENERGY_UNIT=""
+IA_ENERGY_PATH=""
+GT_ENERGY_PATH=""
+PREV_IA_ENERGY=""
+PREV_GT_ENERGY=""
+PREV_IA_MSR_ENERGY=""
+PREV_GT_MSR_ENERGY=""
+PREV_DOMAIN_TIME=""
+
+for domain in /sys/class/powercap/intel-rapl/intel-rapl:0:*; do
+    [ -f "$domain/energy_uj" ] || continue
+    domain_name=$(cat "$domain/name" 2>/dev/null)
+    case "$domain_name" in
+        core|pp0) IA_ENERGY_PATH="$domain" ;;
+        gt|graphics|pp1) GT_ENERGY_PATH="$domain" ;;
+    esac
+done
+
+echo "RAPL_SYSFS_DOMAINS: IA=${IA_ENERGY_PATH:-NA} GT=${GT_ENERGY_PATH:-NA}"
+
+domain_power_mw() {
+    current=$1
+    previous=$2
+    domain_path=$3
+    elapsed=$4
+    [ -n "$current" ] && [ -n "$previous" ] && [ "$elapsed" -gt 0 ] || { echo NA; return; }
+    delta=$((current - previous))
+    if [ "$delta" -lt 0 ]; then
+        range=$(cat "$domain_path/max_energy_range_uj" 2>/dev/null)
+        [ -n "$range" ] || { echo NA; return; }
+        delta=$((delta + range))
+    fi
+    echo $((delta / elapsed / 1000))
+}
 
 run_telemetry_tick() {
     # --------------------------------------------------------------------------
@@ -40,6 +73,51 @@ run_telemetry_tick() {
     CURRENT_ENERGY=0
     PKG_POWER=0
     PKG_POWER_MW=0
+    DOMAIN_TIME=$(date +%s)
+    ELAPSED_DOMAIN_SECONDS=0
+    [ -n "$PREV_DOMAIN_TIME" ] && ELAPSED_DOMAIN_SECONDS=$((DOMAIN_TIME - PREV_DOMAIN_TIME))
+    IA_ENERGY=""
+    GT_ENERGY=""
+    [ -n "$IA_ENERGY_PATH" ] && IA_ENERGY=$(cat "$IA_ENERGY_PATH/energy_uj" 2>/dev/null)
+    [ -n "$GT_ENERGY_PATH" ] && GT_ENERGY=$(cat "$GT_ENERGY_PATH/energy_uj" 2>/dev/null)
+    IA_POWER_MW=$(domain_power_mw "$IA_ENERGY" "$PREV_IA_ENERGY" "$IA_ENERGY_PATH" "$ELAPSED_DOMAIN_SECONDS")
+    GT_POWER_MW=$(domain_power_mw "$GT_ENERGY" "$PREV_GT_ENERGY" "$GT_ENERGY_PATH" "$ELAPSED_DOMAIN_SECONDS")
+    PREV_IA_ENERGY=$IA_ENERGY
+    PREV_GT_ENERGY=$GT_ENERGY
+    PREV_DOMAIN_TIME=$DOMAIN_TIME
+
+    if [ "$IA_POWER_MW" = "NA" ] || [ "$GT_POWER_MW" = "NA" ]; then
+        if [ -z "$RAPL_ENERGY_UNIT" ]; then
+            RAPL_UNIT_RAW=$(/data/local/tmp/iotools rdmsr 0 0x606 2>/dev/null)
+            [ -n "$RAPL_UNIT_RAW" ] && RAPL_ENERGY_UNIT=$(( (RAPL_UNIT_RAW >> 8) & 0x1F ))
+        fi
+    fi
+
+    if [ "$IA_POWER_MW" = "NA" ] && [ -n "$RAPL_ENERGY_UNIT" ]; then
+        IA_MSR_RAW=$(/data/local/tmp/iotools rdmsr 0 0x639 2>/dev/null)
+        if [ -n "$IA_MSR_RAW" ]; then
+            CURRENT_IA_MSR_ENERGY=$(( IA_MSR_RAW & 0xFFFFFFFF ))
+            if [ -n "$PREV_IA_MSR_ENERGY" ] && [ "$ELAPSED_DOMAIN_SECONDS" -gt 0 ]; then
+                IA_MSR_DIFF=$(( CURRENT_IA_MSR_ENERGY - PREV_IA_MSR_ENERGY ))
+                [ "$IA_MSR_DIFF" -lt 0 ] && IA_MSR_DIFF=$(( IA_MSR_DIFF + 4294967296 ))
+                IA_POWER_MW=$(( IA_MSR_DIFF * 1000 / (1 << RAPL_ENERGY_UNIT) / ELAPSED_DOMAIN_SECONDS ))
+            fi
+            PREV_IA_MSR_ENERGY=$CURRENT_IA_MSR_ENERGY
+        fi
+    fi
+
+    if [ "$GT_POWER_MW" = "NA" ] && [ -n "$RAPL_ENERGY_UNIT" ]; then
+        GT_MSR_RAW=$(/data/local/tmp/iotools rdmsr 0 0x641 2>/dev/null)
+        if [ -n "$GT_MSR_RAW" ]; then
+            CURRENT_GT_MSR_ENERGY=$(( GT_MSR_RAW & 0xFFFFFFFF ))
+            if [ -n "$PREV_GT_MSR_ENERGY" ] && [ "$ELAPSED_DOMAIN_SECONDS" -gt 0 ]; then
+                GT_MSR_DIFF=$(( CURRENT_GT_MSR_ENERGY - PREV_GT_MSR_ENERGY ))
+                [ "$GT_MSR_DIFF" -lt 0 ] && GT_MSR_DIFF=$(( GT_MSR_DIFF + 4294967296 ))
+                GT_POWER_MW=$(( GT_MSR_DIFF * 1000 / (1 << RAPL_ENERGY_UNIT) / ELAPSED_DOMAIN_SECONDS ))
+            fi
+            PREV_GT_MSR_ENERGY=$CURRENT_GT_MSR_ENERGY
+        fi
+    fi
     
     if [ -f "$ENERGY_PATH" ]; then
         CURRENT_ENERGY=$(cat "$ENERGY_PATH" 2>/dev/null)
@@ -164,6 +242,8 @@ run_telemetry_tick() {
     done
     echo "SOC_TEMP_CELSIUS: ${SOC_TEMP}"
     echo "PKG_POWER_MW: ${PKG_POWER_MW}"
+    echo "IA_MW: ${IA_POWER_MW}"
+    echo "GT_MW: ${GT_POWER_MW}"
     
     echo "${TIMESTAMP},${VAL_610},${VAL_64F},${VAL_6B0},${SOC_TEMP},${PKG_POWER},${FLAGS}" >> "$LOG_FILE"
 }
