@@ -272,10 +272,14 @@ fi
 echo "[4/4] Recording telemetry metrics dynamically..."
 
 END_TIME=$((SECONDS + DURATION_SEC))
-while [ $SECONDS -lt $END_TIME ]; do
+# Keep sampling while Geekbench runs (flag created by TPTS backend); hard cap of 1h past duration.
+GB_FLAG="/data/local/tmp/tpts_gb_running"
+MAX_END_TIME=$((END_TIME + 3600))
+[ -e "$GB_FLAG" ] && echo "Geekbench selected: telemetry continues until the benchmark completes."
+while [ $SECONDS -lt $END_TIME ] || { [ -e "$GB_FLAG" ] && [ $SECONDS -lt $MAX_END_TIME ]; }; do
     run_telemetry_tick
     echo -e "\n"
-    [ $SECONDS -ge $END_TIME ] && break
+    [ $SECONDS -ge $END_TIME ] && [ ! -e "$GB_FLAG" ] && break
     sleep 1
 done
 

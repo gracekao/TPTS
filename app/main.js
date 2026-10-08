@@ -11,6 +11,8 @@ let hasAutoConnectedLocal = false;
 
 let isDeviceConnected = false;
 let isPipelineRunning = false; 
+let connectedDeviceTarget = '';
+let pendingDeviceConnect = null;
 let connectionTimeout = null;
 let monitorTimer = null;   
 let monitoringElapsedTimer = null;
@@ -83,6 +85,9 @@ let thermalTuneTriggered = false;
 let thermalTuneAverages = {};
 let thermalTuneStableSince = null;
 let thermalTuneLastAdjustmentAt = null;
+// Current (or most recent) Geekbench run and completed runs of this session, newest first.
+let geekbenchRun = null;
+const geekbenchHistory = [];
 
 // 🌊【移動平均快取】：供 Canvas 繪圖平滑化使用
 const filterWindow = [];
@@ -410,9 +415,6 @@ function decodeAndRenderPLFrom610(hex610) {
     currentPowerLimitRegister = hex610;
     if (v610) v610.innerText = hex610;
 
-    setTuningFieldDefault('tune-pl1', pl1_watts);
-    setTuningFieldDefault('tune-pl2', pl2_watts);
-
 }
 
 function decodeAndRenderPL4From601(hex601) {
@@ -424,7 +426,6 @@ function decodeAndRenderPL4From601(hex601) {
     const pl4Text = formatPowerWatts(pl4_watts);
     if (pl4El) pl4El.innerText = `${pl4Text} W`;
     currentPowerLimit4Register = hex601;
-    setTuningFieldDefault('tune-pl4', pl4_watts);
 }
 
 function decodeAndRenderPowerFrom64F(hex64F) {
@@ -842,7 +843,22 @@ function connectDevice() {
     const ip = normalizeTarget(ipEl.value);
     if (!ip) return alert("Please enter IP or local");
     ipEl.value = ip;
+    const previousTarget = connectedDeviceTarget;
     resetLiveDeviceState();
+
+    if (isPipelineRunning) {
+        pendingDeviceConnect = { ip, previousTarget };
+        wasMonitoringBeforePipeline = false;
+        appendConsole(`[TPTS] Stopping work on ${previousTarget || 'current device'} before switching to ${ip}...`);
+        sendAdb(['STOP_PIPELINE']);
+        return;
+    }
+
+    beginDeviceConnection(ip, previousTarget);
+}
+
+function beginDeviceConnection(ip, previousTarget = '') {
+    connectedDeviceTarget = '';
     
     const consoleBox = document.getElementById('console');
     consoleBox.innerText = `[TPTS] [1/2] Resetting ADB interface. Disconnecting ${ip}...\n`;
@@ -864,11 +880,9 @@ function connectDevice() {
         appendConsole(`[TPTS] Connection to ${ip} timed out after 10 seconds.`);
     }, 10000);
     
-    if (isLocalTarget(ip)) {
-        sendAdb(['disconnect', ip]);
-    } else {
-        sendAdb(['disconnect', ip]);
-    }
+    const targetsToDisconnect = [...new Set([previousTarget, ip].filter((target) => target && !isLocalTarget(target)))];
+    if (targetsToDisconnect.length === 0) sendAdb(['disconnect', ip]);
+    else targetsToDisconnect.forEach((target) => sendAdb(['disconnect', target]));
 
     setTimeout(() => {
         consoleBox.innerText += `[TPTS] [2/2] Re-establishing fresh connection link to ${ip}...\n`;
@@ -890,6 +904,28 @@ function resetLiveDeviceState() {
         monitorTimer = null;
     }
     telemetrySampler = null;
+    chartingActive = false;
+    stopMonitoringElapsedCounter();
+    if (pendingChartTimer !== null) {
+        clearTimeout(pendingChartTimer);
+        pendingChartTimer = null;
+    }
+    pendingChartTemperature = null;
+    pendingStructuredTemperature = null;
+    awaitingStructuredSampleEnd = false;
+    telemetryLog = [];
+    telemetryExportSelection = null;
+    resetTuningDefaultSyncState();
+    resetThermalZoneMetrics();
+    detectedFanCount = 0;
+    detectedFanRpms = [];
+    detectedFanDuty = [];
+    fanControlRenderedCount = -1;
+    currentPowerLimitRegister = '';
+    currentPowerLimit4Register = '';
+    autoTuneDryRun = null;
+    autoTuneResult = null;
+    resetThermalTuneTracking();
     syncConnectionUi();
 
     const statusEl = document.getElementById('link-status');
@@ -913,6 +949,10 @@ function resetLiveDeviceState() {
     latestIaPower = null;
     latestGtPower = null;
     latestSocTemp = null;
+    latestCpuFreqGhz = null;
+    latestTcc = 0;
+    latestProchot = 0;
+    latestPowerLimit = 0;
     clearTemperatureHistories();
     powerHistory.length = 0;
     pl1PowerHistory.length = 0;
@@ -930,6 +970,25 @@ function resetLiveDeviceState() {
     });
     const tempElement = document.getElementById('v-temp');
     if (tempElement) tempElement.innerText = '-- °C';
+    ['v-pl1', 'v-pl2', 'v-pl4'].forEach((id) => {
+        const element = document.getElementById(id);
+        if (element) element.innerText = '-- W';
+    });
+    ['v610', 'v64f', 'v6b0'].forEach((id) => {
+        const element = document.getElementById(id);
+        if (element) element.innerText = '0x00000000';
+    });
+    ['tune-pl1', 'tune-pl2', 'tune-pl4'].forEach((id) => {
+        const element = document.getElementById(id);
+        if (element) element.value = '';
+    });
+    geekbenchRun = null;
+    geekbenchHistory.length = 0;
+    const geekbenchPanel = document.getElementById('geekbench-result');
+    if (geekbenchPanel) geekbenchPanel.hidden = true;
+    const autoTunePanel = document.getElementById('auto-tune-result');
+    if (autoTunePanel) autoTunePanel.hidden = true;
+    updateMonitorEvents();
 }
 
 function applyPowerLimits() {
@@ -1133,7 +1192,7 @@ function startPipelineCountdown(seconds) {
             pipelineCountdownTimer = null;
             const countdownEl = document.getElementById('pipeline-countdown');
             if (countdownEl) {
-                countdownEl.innerText = 'Finalizing results...';
+                countdownEl.innerText = isGeekbenchActive() ? 'Waiting for Geekbench to complete...' : 'Finalizing results...';
                 countdownEl.style.color = '#ffaa00';
             }
             if (autoTuneDryRun) {
@@ -1213,10 +1272,11 @@ function stopMonitoringElapsedCounter() {
     monitoringStartedAt = null;
 }
 
-function restoreAllUiToIdle() {
+function restoreAllUiToIdle(resumeMonitoring = true) {
     if (!isPipelineRunning) return;
     isPipelineRunning = false; 
     stopPipelineCountdown();
+    finishGeekbenchRun();
 
     document.querySelectorAll('button, input, select').forEach(el => {
         el.disabled = false; el.style.opacity = "1.0"; el.style.cursor = "pointer";
@@ -1230,11 +1290,16 @@ function restoreAllUiToIdle() {
 
     const monitorBtn = document.querySelector('.btn-secondary');
     if (monitorBtn) {
-        const resumeMonitoring = wasMonitoringBeforePipeline;
         wasMonitoringBeforePipeline = false;
-        chartingActive = true;
-        startLiveTelemetryLoop(!resumeMonitoring);
-        renderMonitorButton(true);
+        if (resumeMonitoring) {
+            chartingActive = true;
+            startLiveTelemetryLoop(true);
+            renderMonitorButton(true);
+        } else {
+            chartingActive = false;
+            stopMonitoringElapsedCounter();
+            renderMonitorButton(false);
+        }
     }
     toggleFanInput();
     toggleStressWorkloadOptions();
@@ -1244,6 +1309,270 @@ function toggleStressWorkloadOptions() {
     const aquariumEnabled = document.querySelector('input[name="stress-workload"][value="aquarium"]')?.checked;
     const fishCount = document.getElementById('aquarium-fish-count');
     if (fishCount) fishCount.disabled = !aquariumEnabled;
+    const geekbenchEnabled = document.querySelector('input[name="stress-workload"][value="geekbench"]')?.checked;
+    for (const id of ['gb-cpu-mode', 'gb-gpu-mode']) {
+        const select = document.getElementById(id);
+        if (select) select.disabled = !geekbenchEnabled;
+    }
+    const estimateEl = document.getElementById('geekbench-estimate');
+    if (estimateEl) {
+        const estimate = estimateGeekbenchSeconds(getGeekbenchSelection());
+        const duration = Number(document.getElementById('duration')?.value) || 0;
+        estimateEl.hidden = !geekbenchEnabled || estimate === 0;
+        estimateEl.innerText = duration < estimate
+            ? `Estimated ~${Math.round(estimate / 60)} min (${estimate}s). Duration ${duration}s is shorter: other workloads stop at ${duration}s while Geekbench continues.`
+            : `Estimated ~${Math.round(estimate / 60)} min (${estimate}s) + ${GEEKBENCH_DURATION_BUFFER_SECONDS}s buffer.`;
+        estimateEl.style.color = duration < estimate ? '#ffaa00' : '';
+    }
+}
+
+// Measured on the x86 test device: CPU all ~230s, GPU OpenCL ~480s.
+function estimateGeekbenchSeconds(selection) {
+    const cpuSeconds = { all: 240, single: 120, multi: 120 }[selection.cpu] || 0;
+    const gpuSeconds = selection.gpu !== 'off' ? 480 : 0;
+    return cpuSeconds + gpuSeconds;
+}
+
+// Extra time after Geekbench so the final samples and result log are captured.
+const GEEKBENCH_DURATION_BUFFER_SECONDS = 60;
+
+function applyGeekbenchDuration() {
+    const geekbenchEnabled = document.querySelector('input[name="stress-workload"][value="geekbench"]')?.checked;
+    const durationEl = document.getElementById('duration');
+    const estimate = estimateGeekbenchSeconds(getGeekbenchSelection());
+    if (geekbenchEnabled && durationEl && estimate > 0) {
+        durationEl.value = Math.min(Number(durationEl.max) || 3600, estimate + GEEKBENCH_DURATION_BUFFER_SECONDS);
+    }
+    toggleStressWorkloadOptions();
+}
+
+function getGeekbenchSelection() {
+    return {
+        cpu: document.getElementById('gb-cpu-mode')?.value || 'all',
+        gpu: document.getElementById('gb-gpu-mode')?.value || 'off'
+    };
+}
+
+function isGeekbenchActive() {
+    return !!geekbenchRun && !geekbenchRun.finishedAt;
+}
+
+function startGeekbenchRun(selection) {
+    geekbenchRun = {
+        startedAt: Date.now(),
+        finishedAt: null,
+        selection,
+        pl1Watts: latestPl1,
+        stage: '',
+        progress: 'Preparing Geekbench on device...',
+        results: {},
+        errors: [],
+        status: 'Running',
+        telemetry: null
+    };
+    renderGeekbenchPanel();
+}
+
+function finishGeekbenchRun(stopped = false) {
+    if (!isGeekbenchActive()) return;
+    const run = geekbenchRun;
+    run.finishedAt = Date.now();
+    const samples = telemetryLog.filter((sample) => sample.t >= run.startedAt && sample.t <= run.finishedAt);
+    const temps = samples.map((sample) => sample.temp).filter(Number.isFinite);
+    run.telemetry = {
+        samples: samples.length,
+        peakTempC: temps.length ? Math.max(...temps) : null,
+        averagePackagePowerW: average(samples.map((sample) => sample.pkg)),
+        throttleSamples: samples.filter((sample) => sample.tcc || sample.prochot).length
+    };
+    const hasResults = Object.keys(run.results).length > 0;
+    run.status = stopped ? 'Stopped' : hasResults ? (run.errors.length ? 'Completed with errors' : 'Completed') : 'No result';
+    run.progress = '';
+    if (hasResults) {
+        geekbenchHistory.unshift(run);
+        if (geekbenchHistory.length > 20) geekbenchHistory.pop();
+    }
+    renderGeekbenchPanel();
+}
+
+function parseGeekbenchScores(kind, data, gpuApi = '') {
+    const cards = [];
+    const workloads = [];
+    const sections = Array.isArray(data?.sections) ? data.sections : [];
+    sections.forEach((section) => {
+        const name = section.name || section.title || `Section ${section.id ?? ''}`.trim();
+        const label = kind === 'gpu' ? `GPU (${gpuApi || name})` : name;
+        const column = kind === 'gpu' ? 'gpu' : /multi/i.test(name) ? 'multi' : 'single';
+        const score = Number(section.score);
+        if (Number.isFinite(score)) cards.push({ label, column, score });
+        (Array.isArray(section.workloads) ? section.workloads : []).forEach((workload) => {
+            workloads.push({ section: label, column, name: workload.name || workload.title || `Workload ${workload.id ?? ''}`, score: Number(workload.score) });
+        });
+    });
+    if (!cards.length && data && typeof data === 'object') {
+        for (const [key, value] of Object.entries(data)) {
+            if (/score/i.test(key) && typeof value === 'number' && Number.isFinite(value)) cards.push({ label: `${kind.toUpperCase()} ${key}`, column: kind === 'gpu' ? 'gpu' : 'single', score: value });
+        }
+    }
+    return { cards, workloads };
+}
+
+function collectGeekbenchScores(run) {
+    const cards = [];
+    const workloads = [];
+    for (const kind of ['cpu', 'gpu']) {
+        if (!run.results[kind]) continue;
+        const parsed = parseGeekbenchScores(kind, run.results[kind], run.selection?.gpu);
+        cards.push(...parsed.cards);
+        workloads.push(...parsed.workloads);
+    }
+    return { cards, workloads };
+}
+
+function renderGeekbenchWorkloadRows(workloads, gpuApi) {
+    const rows = [];
+    const cpuRows = new Map();
+    workloads.filter((workload) => workload.column !== 'gpu').forEach((workload) => {
+        if (!cpuRows.has(workload.name)) cpuRows.set(workload.name, {});
+        cpuRows.get(workload.name)[workload.column] = workload.score;
+    });
+    if (cpuRows.size) {
+        rows.push('<tr><th>CPU Workload</th><th class="num">Single-Core</th><th class="num">Multi-Core</th></tr>');
+        cpuRows.forEach((scores, name) => rows.push(`<tr><td>${escapeHtml(name)}</td><td class="num">${formatGeekbenchScore(scores.single)}</td><td class="num">${formatGeekbenchScore(scores.multi)}</td></tr>`));
+    }
+    const gpuWorkloads = workloads.filter((workload) => workload.column === 'gpu');
+    if (gpuWorkloads.length) {
+        rows.push(`<tr><th>GPU Workload (${escapeHtml(gpuApi || 'GPU')})</th><th class="num">Score</th><th></th></tr>`);
+        gpuWorkloads.forEach((workload) => rows.push(`<tr><td>${escapeHtml(workload.name)}</td><td class="num">${formatGeekbenchScore(workload.score)}</td><td></td></tr>`));
+    }
+    return rows.join('');
+}
+
+function geekbenchColumnScore(cards, column) {
+    return cards.find((card) => card.column === column)?.score;
+}
+
+function formatGeekbenchScore(score) {
+    return Number.isFinite(score) ? Math.round(score).toLocaleString('en-US') : '--';
+}
+
+function renderGeekbenchPanel() {
+    const panel = document.getElementById('geekbench-result');
+    const run = geekbenchRun;
+    if (!panel || !run) return;
+    panel.hidden = false;
+
+    const stateEl = document.getElementById('geekbench-state');
+    if (stateEl) stateEl.innerText = run.finishedAt ? run.status : `Running${run.stage ? ` ${run.stage.toUpperCase()}` : ''}`;
+
+    const progressEl = document.getElementById('geekbench-progress');
+    if (progressEl) {
+        const errorText = run.errors.map((error) => `${error.kind.toUpperCase()}: ${error.message}`).join('\n');
+        progressEl.innerText = errorText || run.progress || '';
+        progressEl.classList.toggle('gb-error', !!errorText);
+    }
+
+    const { cards, workloads } = collectGeekbenchScores(run);
+    const expected = [];
+    if (run.selection.cpu !== 'off' && !run.results.cpu) {
+        if (run.selection.cpu !== 'multi') expected.push('Single-Core');
+        if (run.selection.cpu !== 'single') expected.push('Multi-Core');
+    }
+    if (run.selection.gpu !== 'off' && !run.results.gpu) expected.push(`GPU (${run.selection.gpu})`);
+    const scoresEl = document.getElementById('geekbench-scores');
+    if (scoresEl) {
+        scoresEl.innerHTML = [
+            ...cards.map((card) => `<div class="gb-score"><span>${escapeHtml(card.label)}</span><strong>${formatGeekbenchScore(card.score)}</strong></div>`),
+            ...expected.map((label) => `<div class="gb-score"><span>${escapeHtml(label)}</span><strong>--</strong></div>`)
+        ].join('');
+    }
+
+    const summaryEl = document.getElementById('geekbench-run-summary');
+    if (summaryEl) {
+        const t = run.telemetry;
+        summaryEl.innerText = t
+            ? `PL1 ${formatTuneValue(run.pl1Watts, 3, ' W')} · Peak SoC ${formatTuneValue(t.peakTempC, 1, ' °C')} · Avg Package ${formatTuneValue(t.averagePackagePowerW, 2, ' W')} · Throttle samples ${t.throttleSamples}`
+            : `PL1 ${formatTuneValue(run.pl1Watts, 3, ' W')}`;
+    }
+
+    const workloadsEl = document.getElementById('geekbench-workloads');
+    if (workloadsEl) {
+        workloadsEl.innerHTML = workloads.length
+            ? renderGeekbenchWorkloadRows(workloads, run.selection.gpu)
+            : '<tr><td>No workload data yet.</td></tr>';
+    }
+
+    const historyEl = document.getElementById('geekbench-history');
+    if (historyEl) {
+        historyEl.innerHTML = geekbenchHistory.length
+            ? '<tr><th>Time</th><th class="num">PL1</th><th class="num">Single</th><th class="num">Multi</th><th class="num">GPU</th><th class="num">Peak SoC</th><th class="num">Avg Pkg</th><th class="num">Throttle</th></tr>' + geekbenchHistory.map((entry) => {
+                const entryCards = collectGeekbenchScores(entry).cards;
+                const time = new Date(entry.startedAt).toLocaleTimeString('en-US', { hour12: false });
+                const gpuLabel = entry.selection?.gpu && entry.selection.gpu !== 'off' ? ` <small>${escapeHtml(entry.selection.gpu)}</small>` : '';
+                return `<tr><td>${escapeHtml(time)}</td><td class="num">${formatTuneValue(entry.pl1Watts, 3, ' W')}</td><td class="num">${formatGeekbenchScore(geekbenchColumnScore(entryCards, 'single'))}</td><td class="num">${formatGeekbenchScore(geekbenchColumnScore(entryCards, 'multi'))}</td><td class="num">${formatGeekbenchScore(geekbenchColumnScore(entryCards, 'gpu'))}${gpuLabel}</td><td class="num">${formatTuneValue(entry.telemetry?.peakTempC, 1, ' °C')}</td><td class="num">${formatTuneValue(entry.telemetry?.averagePackagePowerW, 2, ' W')}</td><td class="num">${entry.telemetry?.throttleSamples ?? '--'}</td></tr>`;
+            }).join('')
+            : '<tr><td>No completed runs yet.</td></tr>';
+    }
+}
+
+function processGeekbenchOutput(rawLog) {
+    if (rawLog.startsWith('[Geekbench] ')) {
+        const text = rawLog.slice(12).trim();
+        if (isGeekbenchActive() && /^Running\b/i.test(text)) {
+            geekbenchRun.progress = text;
+            renderGeekbenchPanel();
+        }
+        return false;
+    }
+    if (!rawLog.startsWith('TPTS_GB_')) return false;
+    const line = rawLog.trim();
+    const run = isGeekbenchActive() ? geekbenchRun : null;
+    let match;
+    if ((match = line.match(/^TPTS_GB_STAGE:(cpu|gpu)$/))) {
+        if (run) {
+            run.stage = match[1];
+            run.progress = `Starting ${match[1].toUpperCase()} benchmark...`;
+        }
+        appendConsole(`[Geekbench] Starting ${match[1].toUpperCase()} benchmark.`);
+    } else if ((match = line.match(/^TPTS_GB_RESULT:(cpu|gpu):([\s\S]+)$/))) {
+        try {
+            const data = JSON.parse(match[2]);
+            if (run) run.results[match[1]] = data;
+            const scores = parseGeekbenchScores(match[1], data, run?.selection.gpu).cards.map((card) => `${card.label}=${formatGeekbenchScore(card.score)}`).join(', ');
+            appendConsole(`[Geekbench] ${match[1].toUpperCase()} result: ${scores || 'no score fields found'}`);
+        } catch (error) {
+            if (run) run.errors.push({ kind: match[1], message: `Invalid result JSON (${error.message})` });
+        }
+    } else if ((match = line.match(/^TPTS_GB_ERROR:(\w+):(.*)$/))) {
+        if (run) run.errors.push({ kind: match[1], message: match[2] });
+        appendConsole(`[Geekbench Error] ${match[1]}: ${match[2]}`);
+    } else if (line === 'TPTS_GB_DONE') {
+        finishGeekbenchRun();
+        return true;
+    }
+    renderGeekbenchPanel();
+    return true;
+}
+
+function exportGeekbenchResults() {
+    if (!geekbenchHistory.length) return alert('No Geekbench results available yet.');
+    const payload = geekbenchHistory.map((run) => ({
+        startedAt: new Date(run.startedAt).toISOString(),
+        finishedAt: run.finishedAt ? new Date(run.finishedAt).toISOString() : null,
+        selection: run.selection,
+        pl1Watts: run.pl1Watts,
+        telemetry: run.telemetry,
+        scores: collectGeekbenchScores(run).cards,
+        errors: run.errors,
+        results: run.results
+    }));
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `geekbench-session-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
 }
 
 function startThermalPipeline() {
@@ -1252,6 +1581,7 @@ function startThermalPipeline() {
     if (isPipelineRunning) {
         sendAdb(['STOP_PIPELINE']);
         stopPipelineCountdown();
+        finishGeekbenchRun(true);
         restoreAllUiToIdle();
         return;
     }
@@ -1259,6 +1589,18 @@ function startThermalPipeline() {
     const workloads = [...document.querySelectorAll('input[name="stress-workload"]:checked')].map((input) => input.value);
     if (workloads.length === 0) {
         return alert("Select at least one stress workload.");
+    }
+    const geekbench = getGeekbenchSelection();
+    if (workloads.includes('geekbench') && geekbench.cpu === 'off' && geekbench.gpu === 'off') {
+        return alert('Select a Geekbench CPU or GPU benchmark.');
+    }
+    if (workloads.includes('geekbench')) {
+        const estimate = estimateGeekbenchSeconds(geekbench);
+        const duration = Number(document.getElementById('duration')?.value) || 0;
+        const others = workloads.filter((workload) => workload !== 'geekbench');
+        if (others.length && duration < estimate && !confirm(`Geekbench needs about ${estimate}s, but Duration is ${duration}s.\n${others.join(', ')} will stop at ${duration}s while Geekbench keeps running, so later Geekbench results run without the extra load.\n\nSet Duration to ${estimate}s or more for a full-load run. Continue anyway?`)) {
+            return;
+        }
     }
 
     if (monitorTimer !== null) {
@@ -1303,9 +1645,10 @@ function startThermalPipeline() {
         return alert('Fish count must be a positive integer.');
     }
     startPipelineCountdown(sec);
+    if (workloads.includes('geekbench')) startGeekbenchRun(geekbench);
     
     document.getElementById('console').innerHTML += `\n[TPTS Pipeline] Starting: ${workloads.join(', ')} (${sec}s).\n`;
-    sendAdb(['START_AUTOPILOT_PIPELINE', sec, workloads.join(','), fishCount]);
+    sendAdb(['START_AUTOPILOT_PIPELINE', sec, workloads.join(','), fishCount, geekbench.cpu, geekbench.gpu]);
 }
 
 function average(values) {
@@ -2358,6 +2701,7 @@ socket.onmessage = (event) => {
         const lowOutput = rawLog.toLowerCase();
 
         if (processThermalJsonBackendOutput(rawLog)) return;
+        if (processGeekbenchOutput(rawLog)) return;
 
         if (rawLog.includes("TPTS_TUNING_SYNC_BEGIN")) {
             tuningSyncInProgress = true;
@@ -2423,7 +2767,14 @@ socket.onmessage = (event) => {
         }
 
         if (rawLog.trim().includes("[TPTS_SIGNAL_FORCE_UNLOCKED]") || rawLog.includes("FORCE_UNLOCKED")) {
-            restoreAllUiToIdle();
+            if (pendingDeviceConnect) {
+                const { ip, previousTarget } = pendingDeviceConnect;
+                pendingDeviceConnect = null;
+                restoreAllUiToIdle(false);
+                beginDeviceConnection(ip, previousTarget);
+            } else {
+                restoreAllUiToIdle();
+            }
             return;
         }
 
@@ -2752,6 +3103,7 @@ socket.onmessage = (event) => {
                 connectionTimeout = null;
             }
             isDeviceConnected = true;
+            connectedDeviceTarget = normalizeTarget(document.getElementById('ip')?.value || '');
             syncConnectionUi();
             resetTuningDefaultSyncState();
             resetThermalZoneMetrics();

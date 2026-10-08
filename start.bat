@@ -4,6 +4,10 @@ title TPTS Core Dashboard Launcher
 :: Force working directory to current folder
 cd /d "%~dp0"
 
+echo [0/4] Checking Geekbench package...
+call "%~dp0download_geekbench.bat"
+if errorlevel 1 echo [Geekbench] Package unavailable. TPTS will start; Geekbench runs will need the package.
+
 echo [1/4] Killing leftover processes...
 taskkill /f /im tpts_backend.exe >nul 2>&1
 
