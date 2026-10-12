@@ -222,6 +222,7 @@
                             <div class="geekbench-options">
                                 <div class="form-group"><label for="gb-cpu-mode">CPU Benchmark</label><select id="gb-cpu-mode" onchange="applyGeekbenchDuration()" disabled><option value="all">Single + Multi-Core</option><option value="single">Single-Core</option><option value="multi">Multi-Core</option><option value="off">Off</option></select></div>
                                 <div class="form-group"><label for="gb-gpu-mode">GPU Benchmark</label><select id="gb-gpu-mode" onchange="applyGeekbenchDuration()" disabled><option value="off">Off</option><option value="Vulkan">Vulkan</option><option value="OpenCL">OpenCL</option></select></div>
+                                <div class="gb-progress" id="geekbench-package-status" style="grid-column:1/-1" role="status" hidden></div>
                                 <div class="gb-progress" id="geekbench-estimate" style="grid-column:1/-1" hidden></div>
                             </div>
                         </div>

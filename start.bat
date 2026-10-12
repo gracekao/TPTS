@@ -24,14 +24,13 @@ exit /b 1
 :backend_ready
 start /b "" "%~dp0proxy\adb.exe" start-server >nul 2>&1
 start /b "" "%~dp0proxy\adb.exe" shell su 0 svc power stayon true >nul 2>&1
-start "" /b "%ComSpec%" /c ""%~dp0download_geekbench.bat" ^> "%TEMP%\TPTS-Geekbench-download.log" 2^>^&1"
 
 echo.
 echo ===================================================
 echo  🚀 TPTS Dashboard Started
 echo  🌐 Dashboard Link: http://localhost:8080
 echo  ℹ  Enter the device IP in the dashboard, then establish the ADB link.
-echo  ℹ  Optional Geekbench setup runs in the background.
+echo  ℹ  Geekbench downloads only when selected in the dashboard.
 echo ===================================================
 echo.
 

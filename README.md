@@ -12,8 +12,8 @@ Thermal & Power Tuning System for Android device thermal management, stress test
 
 ### Windows
 
-1. Install GitHub CLI (`gh`) and sign in with access to this repository (`gh auth login`). On first launch, `start.bat` downloads the Geekbench package from the `geekbench-7.0.0` Release if it is missing.
-2. Double-click `start.bat` — it starts the local dashboard and opens `http://localhost:8080`.
+1. Double-click `start.bat` — it starts the local dashboard and opens `http://localhost:8080`.
+2. Geekbench is optional. The package downloads only when you first select **Geekbench 7**; install GitHub CLI (`gh`) and sign in with access to this repository (`gh auth login`) before selecting it.
 3. Enter the Android target IP (for example, `10.225.75.45:5555`) and click **Establish ADB Link**.
 4. When the status changes to `[Connected]`, use **Live Monitor** for real-time temperatures, package power, and fan speed. To view IA or GT power, select **IA Power** and/or **GT Power** in the metric list. Click **Start Monitoring** to draw the live charts and enable CSV logging. IA/GT readings require a supported Intel RAPL domain; a GT reading of `0 W` can mean no GT energy change during that sample.
 5. Open **Thermal Tune** to manage:

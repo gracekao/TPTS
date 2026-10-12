@@ -88,6 +88,8 @@ let thermalTuneLastAdjustmentAt = null;
 // Current (or most recent) Geekbench run and completed runs of this session, newest first.
 let geekbenchRun = null;
 const geekbenchHistory = [];
+let geekbenchPackageState = 'unchecked';
+let geekbenchWasEnabled = false;
 
 // 🌊【移動平均快取】：供 Canvas 繪圖平滑化使用
 const filterWindow = [];
@@ -1314,6 +1316,12 @@ function toggleStressWorkloadOptions() {
         const select = document.getElementById(id);
         if (select) select.disabled = !geekbenchEnabled;
     }
+    if (geekbenchEnabled && !geekbenchWasEnabled) {
+        requestGeekbenchPackage();
+    }
+    geekbenchWasEnabled = Boolean(geekbenchEnabled);
+    const packageStatusEl = document.getElementById('geekbench-package-status');
+    if (packageStatusEl) packageStatusEl.hidden = !geekbenchEnabled || geekbenchPackageState === 'unchecked';
     const estimateEl = document.getElementById('geekbench-estimate');
     if (estimateEl) {
         const estimate = estimateGeekbenchSeconds(getGeekbenchSelection());
@@ -1324,6 +1332,25 @@ function toggleStressWorkloadOptions() {
             : `Estimated ~${Math.round(estimate / 60)} min (${estimate}s) + ${GEEKBENCH_DURATION_BUFFER_SECONDS}s buffer.`;
         estimateEl.style.color = duration < estimate ? '#ffaa00' : '';
     }
+}
+
+function setGeekbenchPackageStatus(state, message) {
+    geekbenchPackageState = state;
+    const statusEl = document.getElementById('geekbench-package-status');
+    if (!statusEl) return;
+    statusEl.innerText = message;
+    statusEl.style.color = state === 'error' ? '#ff6672' : state === 'ready' ? '#7dd3a7' : '';
+    statusEl.hidden = !document.querySelector('input[name="stress-workload"][value="geekbench"]')?.checked;
+}
+
+function requestGeekbenchPackage() {
+    if (geekbenchPackageState === 'ready' || geekbenchPackageState === 'checking' || geekbenchPackageState === 'downloading') return;
+    if (socket.readyState !== WebSocket.OPEN) {
+        setGeekbenchPackageStatus('error', 'Backend is not connected. Toggle Geekbench off and on to retry.');
+        return;
+    }
+    setGeekbenchPackageStatus('checking', 'Checking Geekbench package...');
+    sendAdb(['INSTALL_GEEKBENCH']);
 }
 
 // Measured on the x86 test device: CPU all ~230s, GPU OpenCL ~480s.
@@ -1516,6 +1543,14 @@ function renderGeekbenchPanel() {
 }
 
 function processGeekbenchOutput(rawLog) {
+    const setupMatch = rawLog.trim().match(/^TPTS_GB_SETUP:(READY|DOWNLOADING|ERROR)(?::(.*))?$/);
+    if (setupMatch) {
+        const [, state, detail = ''] = setupMatch;
+        if (state === 'READY') setGeekbenchPackageStatus('ready', 'Geekbench package ready.');
+        else if (state === 'DOWNLOADING') setGeekbenchPackageStatus('downloading', 'Downloading Geekbench package. This is a large download and happens only once.');
+        else setGeekbenchPackageStatus('error', detail);
+        return true;
+    }
     if (rawLog.startsWith('[Geekbench] ')) {
         const text = rawLog.slice(12).trim();
         if (isGeekbenchActive() && /^Running\b/i.test(text)) {
@@ -1593,6 +1628,9 @@ function startThermalPipeline() {
     const geekbench = getGeekbenchSelection();
     if (workloads.includes('geekbench') && geekbench.cpu === 'off' && geekbench.gpu === 'off') {
         return alert('Select a Geekbench CPU or GPU benchmark.');
+    }
+    if (workloads.includes('geekbench') && geekbenchPackageState !== 'ready') {
+        return alert('Wait until the Geekbench package is ready before starting the test.');
     }
     if (workloads.includes('geekbench')) {
         const estimate = estimateGeekbenchSeconds(geekbench);
