@@ -1,6 +1,6 @@
 @echo off
 setlocal
-set "REPO=gracekao/TPTS_v1.0"
+set "REPO=gracekao/TPTS"
 set "RELEASE_TAG=geekbench-7.0.0"
 set "ASSET=Geekbench-7.0.0-Android-Corporate.zip"
 set "PACKAGE_DIR=%~dp0stress_apk\Geekbench-7.0.0-Android-Corporate"

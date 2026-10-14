@@ -16,7 +16,7 @@ fi
 
 if [ ! -f "$APP_DIR/index.html" ]; then
   echo "[TPTS] Missing app assets: app/index.html"
-  echo "[TPTS] Copy full TPTS_v1.0 folder (including app/) to device, then retry."
+  echo "[TPTS] Copy the full TPTS folder (including app/) to device, then retry."
   exit 1
 fi
 

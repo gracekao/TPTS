@@ -1,12 +1,11 @@
-# TPTS v1.0
+# TPTS
 
 Thermal & Power Tuning System for Android device thermal management, stress testing, and power optimization.
 
 ## Download
 
-1. Open repository page: https://github.com/gracekao/TPTS_v1.0
-2. Click `Code` -> `Download ZIP`
-3. Extract ZIP
+1. Open the [TPTS v1.0.0 Release](https://github.com/gracekao/TPTS/releases/tag/v1.0.0).
+2. Download the source ZIP and extract it.
 
 ## End User Quick Start
 
@@ -32,7 +31,7 @@ Thermal & Power Tuning System for Android device thermal management, stress test
 
 ### Android Local Mode
 
-1. Copy this folder to device (recommended: `/data/local/tmp/TPTS_v1.0`)
+1. Copy this folder to device (recommended: `/data/local/tmp/TPTS`)
 2. Run `sh start_android.sh`
 3. Open `http://127.0.0.1:8080`
 4. Target IP field uses `local`

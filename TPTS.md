@@ -39,9 +39,9 @@ Thermal & Power Tuning System for Android device thermal management, stress test
 
 1. Build Android backend binary:
         - `cd proxy && GOOS=android GOARCH=arm64 go build -o tpts_backend_android_arm64 .`
-2. Copy whole `TPTS_v1.0` folder to Android filesystem (recommended under `/data/local/tmp/TPTS_v1.0`).
+2. Copy whole `TPTS` folder to Android filesystem (recommended under `/data/local/tmp/TPTS`).
 3. Start local backend on Android:
-        - `cd /data/local/tmp/TPTS_v1.0 && sh start_android.sh`
+        - `cd /data/local/tmp/TPTS && sh start_android.sh`
 4. Open browser on Android and navigate to:
         - `http://127.0.0.1:8080`
 5. In dashboard target input, enter `local`, then click **Establish ADB Link**.
@@ -120,7 +120,7 @@ TPTS collects the following data from the connected Android device. Live Monitor
 ## Project Structure
 
 ```
-TPTS_v1.0/
+TPTS/
 ├── start.bat              # Launcher - runs backend & opens dashboard
 ├── start.sh               # Linux launcher
 ├── start_android.sh       # Android launcher (local mode)
