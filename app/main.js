@@ -20,6 +20,7 @@ let monitoringStartedAt = null;
 let lastMonitoringElapsedSeconds = 0;
 let pipelineCountdownTimer = null;
 let pipelineCountdownRemaining = 0;
+let pipelineCountdownLabel = 'Countdown';
 let wasMonitoringBeforePipeline = false; 
 let hasSyncedTuningDefaults = false;
 const tuningDefaults = { pl1: null, pl2: null, pl4: null };
@@ -1172,16 +1173,17 @@ function renderPipelineCountdown() {
         countdownEl.style.color = '#8a8a9e';
         return;
     }
-    countdownEl.innerText = `Countdown: ${pipelineCountdownRemaining}s`;
+    countdownEl.innerText = `${pipelineCountdownLabel}: ${pipelineCountdownRemaining}s`;
     countdownEl.style.color = '#00ffcc';
 }
 
-function startPipelineCountdown(seconds) {
+function startPipelineCountdown(seconds, label = 'Countdown') {
     if (pipelineCountdownTimer) {
         clearInterval(pipelineCountdownTimer);
         pipelineCountdownTimer = null;
     }
 
+    pipelineCountdownLabel = label;
     pipelineCountdownRemaining = Math.max(0, parseInt(seconds, 10) || 0);
     renderPipelineCountdown();
     if (pipelineCountdownRemaining <= 0) return;
@@ -1227,7 +1229,7 @@ function lockGlobalUiForPipeline() {
     const runBtn = document.querySelector('button[onclick="startThermalPipeline()"]');
     if (runBtn) {
         runBtn.disabled = false; runBtn.style.opacity = "1.0"; runBtn.style.cursor = "pointer";
-        runBtn.innerText = "Stop Stress Test";
+        runBtn.innerText = isGeekbenchMode() ? "Stop Geekbench" : "Stop Stress Test";
         runBtn.style.background = "#ff4444"; runBtn.style.color = "#ffffff";
     }
 
@@ -1307,30 +1309,42 @@ function restoreAllUiToIdle(resumeMonitoring = true) {
     toggleStressWorkloadOptions();
 }
 
+function isGeekbenchMode() {
+    return document.querySelector('input[name="stress-mode"]:checked')?.value === 'geekbench';
+}
+
+function getSelectedWorkloads() {
+    if (isGeekbenchMode()) return ['geekbench'];
+    return [...document.querySelectorAll('input[name="stress-workload"]:checked')].map((input) => input.value);
+}
+
 function toggleStressWorkloadOptions() {
+    const geekbenchEnabled = isGeekbenchMode();
+    const stressPanel = document.getElementById('stress-mode-panel');
+    const geekbenchPanel = document.getElementById('geekbench-mode-panel');
+    if (stressPanel) stressPanel.hidden = geekbenchEnabled;
+    if (geekbenchPanel) geekbenchPanel.hidden = !geekbenchEnabled;
+    const startButton = document.getElementById('stress-start-button');
+    if (startButton && !isPipelineRunning) startButton.innerText = geekbenchEnabled ? 'Start Geekbench' : 'Start Stress Test';
+    if (isPipelineRunning) return;
+
     const aquariumEnabled = document.querySelector('input[name="stress-workload"][value="aquarium"]')?.checked;
     const fishCount = document.getElementById('aquarium-fish-count');
     if (fishCount) fishCount.disabled = !aquariumEnabled;
-    const geekbenchEnabled = document.querySelector('input[name="stress-workload"][value="geekbench"]')?.checked;
-    for (const id of ['gb-cpu-mode', 'gb-gpu-mode']) {
-        const select = document.getElementById(id);
-        if (select) select.disabled = !geekbenchEnabled;
-    }
     if (geekbenchEnabled && !geekbenchWasEnabled) {
         requestGeekbenchPackage();
     }
-    geekbenchWasEnabled = Boolean(geekbenchEnabled);
+    geekbenchWasEnabled = geekbenchEnabled;
     const packageStatusEl = document.getElementById('geekbench-package-status');
     if (packageStatusEl) packageStatusEl.hidden = !geekbenchEnabled || geekbenchPackageState === 'unchecked';
     const estimateEl = document.getElementById('geekbench-estimate');
     if (estimateEl) {
         const estimate = estimateGeekbenchSeconds(getGeekbenchSelection());
-        const duration = Number(document.getElementById('duration')?.value) || 0;
-        estimateEl.hidden = !geekbenchEnabled || estimate === 0;
-        estimateEl.innerText = duration < estimate
-            ? `Estimated ~${Math.round(estimate / 60)} min (${estimate}s). Duration ${duration}s is shorter: other workloads stop at ${duration}s while Geekbench continues.`
-            : `Estimated ~${Math.round(estimate / 60)} min (${estimate}s) + ${GEEKBENCH_DURATION_BUFFER_SECONDS}s buffer.`;
-        estimateEl.style.color = duration < estimate ? '#ffaa00' : '';
+        estimateEl.hidden = !geekbenchEnabled;
+        estimateEl.innerText = estimate > 0
+            ? `Estimated ~${Math.round(estimate / 60)} min (${estimate}s). The test ends when Geekbench completes.`
+            : 'Select a CPU or GPU benchmark.';
+        estimateEl.style.color = estimate > 0 ? '' : '#ffaa00';
     }
 }
 
@@ -1340,13 +1354,13 @@ function setGeekbenchPackageStatus(state, message) {
     if (!statusEl) return;
     statusEl.innerText = message;
     statusEl.style.color = state === 'error' ? '#ff6672' : state === 'ready' ? '#7dd3a7' : '';
-    statusEl.hidden = !document.querySelector('input[name="stress-workload"][value="geekbench"]')?.checked;
+    statusEl.hidden = !isGeekbenchMode();
 }
 
 function requestGeekbenchPackage() {
     if (geekbenchPackageState === 'ready' || geekbenchPackageState === 'checking' || geekbenchPackageState === 'downloading') return;
     if (socket.readyState !== WebSocket.OPEN) {
-        setGeekbenchPackageStatus('error', 'Backend is not connected. Toggle Geekbench off and on to retry.');
+        setGeekbenchPackageStatus('error', 'Backend is not connected. Switch to Stress Workloads and back to Geekbench 7 to retry.');
         return;
     }
     setGeekbenchPackageStatus('checking', 'Checking Geekbench package...');
@@ -1360,18 +1374,8 @@ function estimateGeekbenchSeconds(selection) {
     return cpuSeconds + gpuSeconds;
 }
 
-// Extra time after Geekbench so the final samples and result log are captured.
-const GEEKBENCH_DURATION_BUFFER_SECONDS = 60;
-
-function applyGeekbenchDuration() {
-    const geekbenchEnabled = document.querySelector('input[name="stress-workload"][value="geekbench"]')?.checked;
-    const durationEl = document.getElementById('duration');
-    const estimate = estimateGeekbenchSeconds(getGeekbenchSelection());
-    if (geekbenchEnabled && durationEl && estimate > 0) {
-        durationEl.value = Math.min(Number(durationEl.max) || 3600, estimate + GEEKBENCH_DURATION_BUFFER_SECONDS);
-    }
-    toggleStressWorkloadOptions();
-}
+// Minimum telemetry duration for Geekbench mode; the device script keeps sampling while Geekbench runs.
+const GEEKBENCH_MODE_MIN_DURATION_SECONDS = 5;
 
 function getGeekbenchSelection() {
     return {
@@ -1625,24 +1629,17 @@ function startThermalPipeline() {
         return;
     }
 
-    const workloads = [...document.querySelectorAll('input[name="stress-workload"]:checked')].map((input) => input.value);
+    const workloads = getSelectedWorkloads();
     if (workloads.length === 0) {
         return alert("Select at least one stress workload.");
     }
+    const geekbenchMode = workloads.includes('geekbench');
     const geekbench = getGeekbenchSelection();
-    if (workloads.includes('geekbench') && geekbench.cpu === 'off' && geekbench.gpu === 'off') {
+    if (geekbenchMode && geekbench.cpu === 'off' && geekbench.gpu === 'off') {
         return alert('Select a Geekbench CPU or GPU benchmark.');
     }
-    if (workloads.includes('geekbench') && geekbenchPackageState !== 'ready') {
+    if (geekbenchMode && geekbenchPackageState !== 'ready') {
         return alert('Wait until the Geekbench package is ready before starting the test.');
-    }
-    if (workloads.includes('geekbench')) {
-        const estimate = estimateGeekbenchSeconds(geekbench);
-        const duration = Number(document.getElementById('duration')?.value) || 0;
-        const others = workloads.filter((workload) => workload !== 'geekbench');
-        if (others.length && duration < estimate && !confirm(`Geekbench needs about ${estimate}s, but Duration is ${duration}s.\n${others.join(', ')} will stop at ${duration}s while Geekbench keeps running, so later Geekbench results run without the extra load.\n\nSet Duration to ${estimate}s or more for a full-load run. Continue anyway?`)) {
-            return;
-        }
     }
 
     if (monitorTimer !== null) {
@@ -1679,17 +1676,21 @@ function startThermalPipeline() {
         drawPowerChartGrid();
     }
     const durationEl = document.getElementById('duration');
-    const sec = durationEl ? durationEl.value : "60";
+    const sec = geekbenchMode ? String(GEEKBENCH_MODE_MIN_DURATION_SECONDS) : (durationEl ? durationEl.value : "60");
     const fishCountInput = document.getElementById('aquarium-fish-count');
     const fishCount = fishCountInput?.value || "30000";
     if (workloads.includes('aquarium') && (!/^\d+$/.test(fishCount) || Number(fishCount) < 1)) {
         restoreAllUiToIdle();
         return alert('Fish count must be a positive integer.');
     }
-    startPipelineCountdown(sec);
-    if (workloads.includes('geekbench')) startGeekbenchRun(geekbench);
-    
-    document.getElementById('console').innerHTML += `\n[TPTS Pipeline] Starting: ${workloads.join(', ')} (${sec}s).\n`;
+    if (geekbenchMode) {
+        startPipelineCountdown(estimateGeekbenchSeconds(geekbench), 'Geekbench est. remaining');
+        startGeekbenchRun(geekbench);
+        document.getElementById('console').innerHTML += `\n[TPTS Pipeline] Starting Geekbench 7 benchmark only (CPU: ${geekbench.cpu}, GPU: ${geekbench.gpu}). No other stress workloads run.\n`;
+    } else {
+        startPipelineCountdown(sec);
+        document.getElementById('console').innerHTML += `\n[TPTS Pipeline] Starting: ${workloads.join(', ')} (${sec}s).\n`;
+    }
     sendAdb(['START_AUTOPILOT_PIPELINE', sec, workloads.join(','), fishCount, geekbench.cpu, geekbench.gpu]);
 }
 
@@ -2006,7 +2007,8 @@ function startAutoTuneDryRun() {
     const pl4 = Number(document.getElementById('tune-pl4')?.value);
     if (![pl1, pl2, pl4].every((value) => Number.isFinite(value) && value > 0)) return alert('Set PL1, PL2, and PL4 before starting Auto Tune.');
     if (control.minimumPl1Watts > pl1) return alert('Minimum PL1 must not exceed the starting PL1.');
-    const workloads = [...document.querySelectorAll('input[name="stress-workload"]:checked')].map((input) => input.value);
+    if (isGeekbenchMode()) return alert('Auto Tune adjusts PL1 during the run, which would distort Geekbench scores. Switch the Stress Test mode to Stress Workloads first.');
+    const workloads = getSelectedWorkloads();
     if (!workloads.length) return alert('Select at least one stress workload.');
     const duration = Number(document.getElementById('duration')?.value || 60);
     autoTuneDryRun = { thresholds, workloads, duration, startedAt: Date.now(), startingPl1: pl1, adjustments: [] };

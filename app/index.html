@@ -90,6 +90,15 @@
         .stress-controls { display:grid; grid-template-columns:220px 1fr 1fr; gap:12px; align-items:end; margin-top:17px; }
         .stress-controls button { margin:0; } #pipeline-countdown { margin-top:9px; color:var(--muted); font:12px Consolas,monospace; }
         .stress-workloads { display:grid; gap:9px; margin:0 0 13px; }
+        .stress-workloads[hidden] { display:none; }
+        .stress-mode { display:grid; grid-template-columns:1fr 1fr; gap:0; margin:0 0 12px; border:1px solid var(--border); border-radius:5px; overflow:hidden; }
+        .stress-mode label { display:block; cursor:pointer; }
+        .stress-mode input { position:absolute; opacity:0; pointer-events:none; }
+        .stress-mode span { display:block; padding:8px 6px; background:var(--deep); color:var(--muted); font-size:12px; font-weight:700; text-align:center; }
+        .stress-mode label + label span { border-left:1px solid var(--border); }
+        .stress-mode input:checked + span { background:#291522; color:#ff9abe; }
+        .stress-mode input:focus-visible + span { outline:2px solid var(--pink); outline-offset:-2px; }
+        .stress-mode input:disabled + span { opacity:.4; cursor:not-allowed; }
         .stress-workload { display:grid; grid-template-columns:16px minmax(0,1fr); align-items:center; gap:9px; padding:10px; border:1px solid var(--border); border-radius:5px; background:var(--deep); cursor:pointer; }
         .stress-workload:has(input:checked) { border-color:var(--pink); background:#291522; }
         .stress-workload:has(input:checked) strong { color:#ff9abe; }
@@ -214,19 +223,26 @@
                     </div>
                     <div class="section" id="tab-stress-test">
                         <h4>🔥 Stress Test <span class="current-hint" style="margin-left:auto">Auto Tune workload</span></h4>
-                        <div class="stress-workloads">
+                        <div class="stress-mode" role="radiogroup" aria-label="Test mode">
+                            <label><input type="radio" name="stress-mode" value="stress" checked onchange="toggleStressWorkloadOptions()"><span>Stress Workloads</span></label>
+                            <label><input type="radio" name="stress-mode" value="geekbench" onchange="toggleStressWorkloadOptions()"><span>Geekbench 7</span></label>
+                        </div>
+                        <div class="stress-workloads" id="stress-mode-panel">
                             <label class="stress-workload"><input type="checkbox" name="stress-workload" value="stressapptest" checked><span><strong>stressapptest</strong><small>CPU and memory workload</small></span></label>
                             <label class="stress-workload"><input type="checkbox" name="stress-workload" value="aquarium" onchange="toggleStressWorkloadOptions()"><span><strong>WebGL Aquarium</strong><small>Chrome, 60 FPS, 1024 × 1024 canvas</small></span></label>
                             <div class="fish-count-control"><label for="aquarium-fish-count">Fish count (min 1)</label><input id="aquarium-fish-count" aria-label="Number of Fish" type="number" min="1" step="1" value="30000" disabled></div>
-                            <label class="stress-workload"><input type="checkbox" name="stress-workload" value="geekbench" onchange="toggleStressWorkloadOptions(); applyGeekbenchDuration()"><span><strong>Geekbench 7</strong><small>Offline, no upload. Duration is the minimum; runs until the benchmark completes</small></span></label>
+                            <div class="form-group"><label for="duration">Duration (sec)</label><input type="number" id="duration" value="30" min="5" max="3600"></div>
+                        </div>
+                        <div class="stress-workloads" id="geekbench-mode-panel" hidden>
+                            <div class="gb-progress">Geekbench runs alone (no other stress workloads), offline with no upload. Telemetry records until the benchmark completes.</div>
                             <div class="geekbench-options">
-                                <div class="form-group"><label for="gb-cpu-mode">CPU Benchmark</label><select id="gb-cpu-mode" onchange="applyGeekbenchDuration()" disabled><option value="all">Single + Multi-Core</option><option value="single">Single-Core</option><option value="multi">Multi-Core</option><option value="off">Off</option></select></div>
-                                <div class="form-group"><label for="gb-gpu-mode">GPU Benchmark</label><select id="gb-gpu-mode" onchange="applyGeekbenchDuration()" disabled><option value="off">Off</option><option value="Vulkan">Vulkan</option><option value="OpenCL">OpenCL</option></select></div>
+                                <div class="form-group"><label for="gb-cpu-mode">CPU Benchmark</label><select id="gb-cpu-mode" onchange="toggleStressWorkloadOptions()"><option value="all">Single + Multi-Core</option><option value="single">Single-Core</option><option value="multi">Multi-Core</option><option value="off">Off</option></select></div>
+                                <div class="form-group"><label for="gb-gpu-mode">GPU Benchmark</label><select id="gb-gpu-mode" onchange="toggleStressWorkloadOptions()"><option value="off">Off</option><option value="Vulkan">Vulkan</option><option value="OpenCL">OpenCL</option></select></div>
                                 <div class="gb-progress" id="geekbench-package-status" style="grid-column:1/-1" role="status" hidden></div>
                                 <div class="gb-progress" id="geekbench-estimate" style="grid-column:1/-1" hidden></div>
                             </div>
                         </div>
-                        <div class="form-group"><label>Duration (sec)</label><input type="number" id="duration" value="30" min="5" max="3600" oninput="toggleStressWorkloadOptions()"></div><button class="danger-button" onclick="startThermalPipeline()">Start Stress Test</button>
+                        <button class="danger-button" id="stress-start-button" onclick="startThermalPipeline()">Start Stress Test</button>
                         <div id="pipeline-countdown">Countdown: --</div>
                         <div class="lamps"><div class="lamp-item"><span class="lamp" id="lamp-thermal"></span>TCC</div><div class="lamp-item"><span class="lamp" id="lamp-prochot"></span>PROCHOT</div><div class="lamp-item"><span class="lamp" id="lamp-power"></span>PL LIMIT</div></div>
                     </div>

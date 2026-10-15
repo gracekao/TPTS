@@ -26,6 +26,7 @@ Thermal & Power Tuning System for Android device thermal management, stress test
         - WebGL Aquarium runs Chrome in fullscreen; system bars are restored when the test completes or is stopped.
         - **WebGL Aquarium** runs in Chrome at 60 FPS with a 1024 × 1024 canvas; choose 1 to 30,000 fish.
         - Click **Start Stress Test** and review Temperature, Power, and Throttle Status for the selected duration.
+        - To benchmark, switch the Stress Test mode to **Geekbench 7**, choose the CPU/GPU benchmark, and click **Start Geekbench**. Geekbench runs alone (other stress workloads are disabled; the backend also enforces this), and telemetry records until it completes.
 
 ## Quick Start (Linux, Technical)
 
@@ -55,7 +56,7 @@ gh release create v1.0.1 dist/TPTS-v1.0.1-full.zip --repo gracekao/TPTS --title 
 
 The script rebuilds all three backends with `-trimpath`, adds the Geekbench package (from `stress_apk/` or the `geekbench-7.0.0` Release), adds Linux `adb` from Google platform-tools, and writes `dist/TPTS-<version>-full.zip` with one top-level `TPTS/` folder and Unix exec permissions.
 
-Windows fallback: if `stress_apk/` is missing, selecting **Geekbench 7** runs `download_geekbench.bat`, which downloads the public Release asset with the built-in `curl.exe` (no GitHub CLI or sign-in needed).
+Windows fallback: if `stress_apk/` is missing, selecting the **Geekbench 7** mode runs `download_geekbench.bat`, which downloads the public Release asset with the built-in `curl.exe` (no GitHub CLI or sign-in needed).
 
 ### Cross-Platform Runtime Rules
 

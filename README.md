@@ -19,7 +19,7 @@ Thermal & Power Tuning System for Android device thermal management, stress test
 	- **CPU Power Limits**: PL1, PL2, and PL4. Device values load as the starting defaults; use **Reset to System Default** to restore them.
 	- **Fan Control**: leave Automatic selected or switch to Manual and set an RPM per detected fan.
 	- **Auto Tune**: set the temperature limits, SoC averaging period, PL1 step, minimum PL1, and recovery hold. Select the workloads and duration before starting. Auto Tune leaves fan control to the EC, adjusts PL1 in steps, and exports a Power Profile when complete; it does not edit the device thermal JSON.
-	- **Stress Test**: select workloads, enter a duration, then review thermal, power, and throttle status. Before starting, TPTS closes Chrome and Settings, returns Android to its launcher, and clears background app processes. WebGL Aquarium runs Chrome in fullscreen and restores system bars when complete. Options include `stressapptest`, WebGL Aquarium (1 to 30,000 fish), and Geekbench 7 CPU/GPU benchmarks. Geekbench runs with `--no-upload`; Duration is a minimum and telemetry continues until it completes.
+	- **Stress Test**: choose a mode at the top. In **Stress Workloads** mode, select workloads, enter a duration, then review thermal, power, and throttle status. Before starting, TPTS closes Chrome and Settings, returns Android to its launcher, and clears background app processes. WebGL Aquarium runs Chrome in fullscreen and restores system bars when complete. Workloads are `stressapptest` and WebGL Aquarium (1 to 30,000 fish). **Geekbench 7** mode runs only the Geekbench CPU/GPU benchmark (no other stress workloads, so scores are not distorted). It runs with `--no-upload`, has no duration setting, and telemetry continues until the benchmark completes. Auto Tune is unavailable in Geekbench 7 mode.
 
 ### Linux (x86_64)
 
@@ -52,7 +52,7 @@ Then:
 - `adb` for Windows (`proxy/adb.exe`) and Linux (`proxy/adb`)
 - Geekbench 7 package (`stress_apk/Geekbench-7.0.0-Android-Corporate/`)
 
-If you use the source ZIP instead of the full package, `stress_apk/` and `proxy/adb` are missing. On Windows, TPTS downloads Geekbench automatically the first time you select **Geekbench 7**. On Linux or Android, extract the [Geekbench ZIP](https://github.com/gracekao/TPTS/releases/download/geekbench-7.0.0/Geekbench-7.0.0-Android-Corporate.zip) under `stress_apk/` yourself.
+If you use the source ZIP instead of the full package, `stress_apk/` and `proxy/adb` are missing. On Windows, TPTS downloads Geekbench automatically the first time you select the **Geekbench 7** mode. On Linux or Android, extract the [Geekbench ZIP](https://github.com/gracekao/TPTS/releases/download/geekbench-7.0.0/Geekbench-7.0.0-Android-Corporate.zip) under `stress_apk/` yourself.
 
 ## Notes
 
