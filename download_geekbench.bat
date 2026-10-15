@@ -1,31 +1,24 @@
 @echo off
 setlocal
-set "REPO=gracekao/TPTS"
-set "RELEASE_TAG=geekbench-7.0.0"
 set "ASSET=Geekbench-7.0.0-Android-Corporate.zip"
+set "ASSET_URL=https://github.com/gracekao/TPTS/releases/download/geekbench-7.0.0/%ASSET%"
 set "PACKAGE_DIR=%~dp0stress_apk\Geekbench-7.0.0-Android-Corporate"
 set "DOWNLOAD_DIR=%TEMP%\TPTS-Geekbench"
 set "ARCHIVE=%DOWNLOAD_DIR%\%ASSET%"
 
 if exist "%PACKAGE_DIR%\geekbench_avx2" if exist "%PACKAGE_DIR%\geekbench_aarch64" if exist "%PACKAGE_DIR%\geekbench.plxr" if exist "%PACKAGE_DIR%\geekbench-workload.plxr" exit /b 0
 
-echo [Geekbench] Package missing. Downloading the GitHub Release asset...
-where gh >nul 2>&1
+echo [Geekbench] Package missing. Downloading %ASSET_URL%
+where curl.exe >nul 2>&1
 if errorlevel 1 (
-    echo [Geekbench] GitHub CLI is not installed. Install gh and run "gh auth login".
-    exit /b 1
-)
-
-gh auth status >nul 2>&1
-if errorlevel 1 (
-    echo [Geekbench] GitHub CLI is not authenticated. Run "gh auth login" first.
+    echo [Geekbench] curl.exe was not found. Download the file above and extract it under stress_apk\.
     exit /b 1
 )
 
 if not exist "%DOWNLOAD_DIR%" mkdir "%DOWNLOAD_DIR%"
-gh release download "%RELEASE_TAG%" --repo "%REPO%" --pattern "%ASSET%" --dir "%DOWNLOAD_DIR%" --clobber
+curl.exe --fail --location --silent --show-error --retry 3 --retry-delay 5 --connect-timeout 30 -o "%ARCHIVE%" "%ASSET_URL%"
 if errorlevel 1 (
-    echo [Geekbench] Download failed. Confirm release asset "%ASSET%" exists and your account can access it.
+    echo [Geekbench] Download failed. Check the network or proxy, or download the file above and extract it under stress_apk\.
     exit /b 1
 )
 
@@ -34,14 +27,14 @@ if errorlevel 1 (
     echo [Geekbench] Could not extract the package archive.
     exit /b 1
 )
+del /q "%ARCHIVE%" >nul 2>&1
 
-if not exist "%PACKAGE_DIR%\geekbench_avx2" (
-    echo [Geekbench] Archive layout is incorrect; expected the Geekbench folder under stress_apk.
-    exit /b 1
+for %%F in (geekbench_avx2 geekbench_aarch64 geekbench.plxr geekbench-workload.plxr) do (
+    if not exist "%PACKAGE_DIR%\%%F" (
+        echo [Geekbench] Archive layout is incorrect; missing %%F under stress_apk\Geekbench-7.0.0-Android-Corporate.
+        exit /b 1
+    )
 )
-if not exist "%PACKAGE_DIR%\geekbench_aarch64" exit /b 1
-if not exist "%PACKAGE_DIR%\geekbench.plxr" exit /b 1
-if not exist "%PACKAGE_DIR%\geekbench-workload.plxr" exit /b 1
 
 echo [Geekbench] Package installed successfully.
 exit /b 0

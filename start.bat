@@ -30,7 +30,6 @@ echo ===================================================
 echo  🚀 TPTS Dashboard Started
 echo  🌐 Dashboard Link: http://localhost:8080
 echo  ℹ  Enter the device IP in the dashboard, then establish the ADB link.
-echo  ℹ  Geekbench downloads only when selected in the dashboard.
 echo ===================================================
 echo.
 

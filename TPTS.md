@@ -29,22 +29,33 @@ Thermal & Power Tuning System for Android device thermal management, stress test
 
 ## Quick Start (Linux, Technical)
 
-1. Build Linux backend binary:
-        - `cd proxy && GOOS=linux GOARCH=amd64 go build -o tpts_backend_linux_amd64 .`
-2. Start dashboard:
-        - `chmod +x start.sh && ./start.sh`
-3. In dashboard, set device target IP (for example `10.225.75.45:5555`) and click **Establish ADB Link**.
+1. Extract the full release ZIP and run `bash start.sh`.
+        - `start.sh` restores exec bits (some unzip tools drop them), starts `proxy/tpts_backend_linux_amd64` with `nohup`, waits for `/healthz`, and writes `logs/backend.log`.
+        - The backend uses `proxy/adb` when present, otherwise `adb` on `PATH`.
+2. In dashboard, set device target IP (for example `10.225.75.45:5555`) and click **Establish ADB Link**.
 
 ## Quick Start (Android Local Device, Technical)
 
-1. Build Android backend binary:
-        - `cd proxy && GOOS=android GOARCH=arm64 go build -o tpts_backend_android_arm64 .`
-2. Copy whole `TPTS` folder to Android filesystem (recommended under `/data/local/tmp/TPTS`).
-3. Start local backend on Android:
-        - `cd /data/local/tmp/TPTS && sh start_android.sh`
-4. Open browser on Android and navigate to:
-        - `http://127.0.0.1:8080`
-5. In dashboard target input, enter `local`, then click **Establish ADB Link**.
+1. Copy the extracted `TPTS` folder to the device, for example `adb push TPTS /data/local/tmp/`.
+2. Start local backend on Android:
+        - `sh /data/local/tmp/TPTS/start_android.sh`
+        - If run from another location (such as noexec `/sdcard`), the script first copies the folder to `/data/local/tmp/TPTS` (falling back to `su 0`) and re-runs from there.
+        - The backend runs under `nohup` (log: `logs/backend.log`), so it keeps running after `adb shell` exits.
+3. The script opens `http://127.0.0.1:8080` in the device browser.
+4. In dashboard target input, enter `local`, then click **Establish ADB Link**.
+
+## Release Packaging
+
+Build the all-in-one package (requires Go and Python; needs the Go source under `proxy/`):
+
+```
+python tools/build_release.py v1.0.1
+gh release create v1.0.1 dist/TPTS-v1.0.1-full.zip --repo gracekao/TPTS --title "TPTS v1.0.1"
+```
+
+The script rebuilds all three backends with `-trimpath`, adds the Geekbench package (from `stress_apk/` or the `geekbench-7.0.0` Release), adds Linux `adb` from Google platform-tools, and writes `dist/TPTS-<version>-full.zip` with one top-level `TPTS/` folder and Unix exec permissions.
+
+Windows fallback: if `stress_apk/` is missing, selecting **Geekbench 7** runs `download_geekbench.bat`, which downloads the public Release asset with the built-in `curl.exe` (no GitHub CLI or sign-in needed).
 
 ### Cross-Platform Runtime Rules
 
@@ -124,7 +135,11 @@ TPTS/
 ├── start.bat              # Launcher - runs backend & opens dashboard
 ├── start.sh               # Linux launcher
 ├── start_android.sh       # Android launcher (local mode)
+├── download_geekbench.bat # Windows fallback Geekbench download
 ├── TPTS.md                # Documentation
+├── tools/
+│   └── build_release.py   # Builds dist/TPTS-<version>-full.zip
+├── stress_apk/            # Geekbench 7 package (in full release ZIP)
 ├── app/
 │   ├── index.html         # Dashboard UI
 │   └── main.js            # Frontend logic & WebSocket handler
@@ -136,7 +151,8 @@ TPTS/
         ├── main.go            # Cross-platform backend source
         ├── go.mod
         ├── go.sum
-    ├── adb.exe            # Android Debug Bridge
+    ├── adb.exe            # Android Debug Bridge (Windows)
+    ├── adb                # Android Debug Bridge (Linux, full release ZIP only)
     ├── AdbWinApi.dll
     ├── AdbWinUsbApi.dll
         ├── tpts_backend.exe                 # Windows backend

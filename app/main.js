@@ -1551,6 +1551,10 @@ function processGeekbenchOutput(rawLog) {
         else setGeekbenchPackageStatus('error', detail);
         return true;
     }
+    if (rawLog.startsWith('[Geekbench Setup] ')) {
+        appendConsole(rawLog.trim());
+        return true;
+    }
     if (rawLog.startsWith('[Geekbench] ')) {
         const text = rawLog.slice(12).trim();
         if (isGeekbenchActive() && /^Running\b/i.test(text)) {
