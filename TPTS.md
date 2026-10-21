@@ -91,20 +91,30 @@ Fan control is represented through thermal HAL cooling-device votes such as `Cde
 
 ### Active Telemetry Sources
 
-TPTS collects the following data from the connected Android device. Live Monitor polls at approximately one-second intervals; the stress script records one sample per second during a stress test.
+TPTS collects the following data from the connected Android device. Live Monitor requests samples at approximately one-second intervals; stress sampling waits one second between ticks. Both paths use the RAPL sampler in `device_tools/run_stressapp.sh`, with a separate monotonic `/proc/uptime` timestamp for each domain read. Power is calculated from the measured elapsed milliseconds, not an assumed one-second interval.
+
+RAPL samples remain unavailable on the first reading, when a source or energy unit changes, or when an energy counter resets. A decrease is treated as rollover only when the previous counter was in the top quarter of its range and the current counter is in the bottom quarter; sysfs uses `max_energy_range_uj`, while MSR uses the 32-bit counter range. Invalid Package Power samples display `-- W` and create a chart gap instead of reusing an old value. This detects anomalous readings but does not repair a device counter that repeatedly resets.
+
+Some devices reset the package energy counter every few seconds (observed on `10.225.75.73`; both sysfs and MSR `0x611` drop to near zero while IA/GT counters keep counting). Package Power is therefore read about every 100 ms inside each one-second window; intervals that contain a reset are skipped, and power is the valid energy divided by the valid time. The status is `partial:<skipped>/<valid ms>` when intervals were skipped. On `10.225.75.23`, this method matched PTAT's `Power-Package Power` within about 3% on average over a synchronized 27-second idle comparison.
+
+`RAPL_SAMPLE` diagnostics record each domain's source, raw energy before/after, monotonic timestamps, counter range, unit, and status. These fields are included in the stress CSV and in dashboard CSV exports for selected power metrics. Enable Telemetry Debug Log to also inspect them in System Log. Reconnect the device after updating the app so the backend deploys the matching script; an older script is not executed by the new live sampler.
+
+Run frontend regression checks with `node tools/test_rapl.js`. Add `--serial <adb-target>` to also validate shell arithmetic and sample-state transitions on a rooted Android device without starting workloads or changing hardware settings. On Linux, set `ADB` to the ADB executable path if it is not on `PATH`.
 
 | Dashboard data | Primary source | Fallback / calculation | Unit | Used by |
 | --- | --- | --- | --- | --- |
 | Package Power | `/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj` | Delta between samples. If unavailable: MSR `0x611` (package energy status) using energy unit from MSR `0x606`. | mW / W | Package Power card, live power chart, CSV log |
 | IA / GT Power | Live Monitor and stress sampling read RAPL child domains named `core`/`pp0` and `gt`/`graphics`/`pp1`; if a domain is unavailable, they read MSR `0x639` (IA/PP0) or `0x641` (GT/PP1), using the energy unit from `0x606`. | Unavailable (`-- W`) when neither source exposes the domain. `uncore` is not assumed to be GT. These domains do not necessarily sum to Package Power. | W | Optional IA / GT cards and power chart |
-| SoC Temp | Thermal zone whose `type` is `x86_pkg_temp` | `thermal_zone0/temp`, then MSR `0x19C` digital temperature sensor; final safety value is 42 C when no usable source exists. | C | SoC Temp card, temperature chart, CSV log |
+| SoC Temp | Thermal zone whose `type` is `x86_pkg_temp` | `thermal_zone0/temp`, then package DTS from MSR `0x1B1` as TjMax − bits `[22:16]`, with TjMax from MSR `0x1A2` bits `[23:16]` (same registers PTAT uses as `MSR_PACKAGE_TEMP` / `MSR_TEMPERATURE_TARGET`); final safety value is 42 C when no usable source exists. | C | SoC Temp card, temperature chart, CSV log |
 | Thermal-zone temperatures | `/sys/class/thermal/thermal_zone*/temp` and matching `type` | None; zones are shown when readable. Raw values above 1000 are converted from millidegrees C for display. | C | Optional thermal-zone cards and temperature chart |
 | CPU frequency | `/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq` | None | kHz, displayed as GHz | CPU Freq card and CSV log |
 | Fan count and RPM | `ectool pwmgetnumfans` and `ectool pwmgetfanrpm` | `/sys/class/hwmon/hwmon*/fan*_input` | RPM | Fan cards and CSV log |
-| PL1 / PL2 | MSR `0x610` | Bits `[0:14]` for PL1 and `[32:46]` for PL2; each raw unit is 0.125 W. | W | Thermal Tune defaults and applied-limit display |
-| PL4 | MSR `0x601` | Bits `[12:0]`; each raw unit is 0.125 W. | W | Thermal Tune defaults and applied-limit display |
-| Thermal / PROCHOT / power-limit flags | MSR `0x19C` | Bit 0: thermal status, bit 2: PROCHOT, bit 10: power-limit status. | Boolean | Status lamps |
-| Raw tuning registers | MSR `0x610`, `0x64F`, `0x6B0`, `0x19C` | No fallback beyond zero placeholder when a read fails. | Hexadecimal | System Log and stress CSV |
+| PL1 / PL2 | MSR `0x610` | Bits `[0:14]` for PL1 and `[32:46]` for PL2; each raw unit is 1/2^N W, where N is MSR `0x606` bits `[3:0]` (0.125 W on tested PTL devices). PL values are not shown or written until the unit has been read. | W | Thermal Tune defaults and applied-limit display |
+| PL4 | MSR `0x601` | Bits `[12:0]`, using the same `0x606` power unit. | W | Thermal Tune defaults and applied-limit display |
+| Thermal / PROCHOT / power-limit flags | MSR `0x1B1` (package thermal status) | Bit 0: thermal status, bit 2: PROCHOT, bit 10: power-limit status. Package scope, matching PTAT; CPU0-only `0x19C` is no longer used. | Boolean | Status lamps, Thermal Events, Auto Tune emergency guard |
+| CPU Limit Reason | MSR `0x64F` (`MSR_CORE_PERF_LIMIT_REASONS`) | Bits 0–13 are current reasons, bits 16–29 are sticky logs; names follow PTAT `IA Clip Reason MSR` (`PROCHOT`, `THERMAL`, `RSR_LIMIT`, `RATL`, `VR_THERMALERT`, `VR_TDC`, `OTHER`, `PBM_PL1`, `PBM_PL2`, `MAX_TURBO_LIMIT`, `TURBO_ATTEN`). TPTS only reads the register and never clears logs. `MAX_TURBO_LIMIT` is common at idle and is shown as a warning, not a fault. | Text | Thermal Events and CSV `cpu_limit_reasons` / `cpu_limit_reasons_logged` |
+| Rest of Package Power | Package − IA − GT | Shown only when all three are valid. Values slightly below zero from timing differences are shown as 0 W; larger negatives are unavailable. Matched PTAT `Rest of Package Power` within about 1% on `10.225.75.23` at idle. | W | Optional card, power chart, CSV |
+| Raw tuning registers | MSR `0x610`, `0x64F`, `0x6B0`, `0x1B1`, `0x1A2`, `0x606` | No fallback beyond zero placeholder when a read fails. | Hexadecimal | System Log and stress CSV |
 
 ## Architecture Overview
 

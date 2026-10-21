@@ -93,7 +93,7 @@
         .stress-workloads[hidden] { display:none; }
         .stress-mode { display:grid; grid-template-columns:1fr 1fr; gap:0; margin:0 0 12px; border:1px solid var(--border); border-radius:5px; overflow:hidden; }
         .stress-mode label { display:block; cursor:pointer; }
-        .stress-mode input { position:absolute; opacity:0; pointer-events:none; }
+        .stress-mode input { position:absolute; opacity:0 !important; pointer-events:none; }
         .stress-mode span { display:block; padding:8px 6px; background:var(--deep); color:var(--muted); font-size:12px; font-weight:700; text-align:center; }
         .stress-mode label + label span { border-left:1px solid var(--border); }
         .stress-mode input:checked + span { background:#291522; color:#ff9abe; }
@@ -190,6 +190,7 @@
                         <div class="event-row" data-event-row="tcc" title="OK: TCC thermal throttle is not active. ACTIVE: the CPU has reached its thermal control limit."><span>TCC Thermal Throttle</span><span class="event-state">OK</span></div>
                         <div class="event-row" data-event-row="prochot" title="OK: PROCHOT is not asserted. ACTIVE: the processor or platform is requesting emergency thermal throttling."><span>PROCHOT</span><span class="event-state">OK</span></div>
                         <div class="event-row" data-event-row="power" title="OK: no package power-limit flag. ACTIVE: the CPU is currently limited by PL1, PL2, or another power policy."><span>PL LIMIT</span><span class="event-state">OK</span></div>
+                        <div class="event-row" data-event-row="clip" title="Current CPU core frequency-limit reasons decoded from MSR 0x64F (same names as PTAT IA Clip Reason)."><span>CPU Limit Reason</span><span class="event-state">--</span></div>
                         <div class="event-row" data-event-row="temperature" title="OK: below 85 °C. HIGH: 85–91 °C. CRITICAL: 92 °C or higher, based on the primary package temperature sensor."><span>High Temperature</span><span class="event-state">OK</span></div>
                         <div class="event-row" data-event-row="fan" title="OK: a fan is detected and reporting RPM. CHECK FAN: temperature is at least 70 °C but all detected fans report 0 RPM."><span>Fan Status</span><span class="event-state">OK</span></div>
                         <div class="event-row" data-event-row="telemetry" title="LIVE: new sensor data received recently. STALE: no new temperature data for more than 3 seconds. WAITING: monitoring has not received data yet."><span>Live Data</span><span class="event-state">Ready</span></div>
@@ -205,6 +206,7 @@
                         <label class="check-row"><input type="checkbox" data-metric="pl2-power"> PL2</label>
                         <label class="check-row"><input type="checkbox" data-metric="ia-power"> IA Power</label>
                         <label class="check-row"><input type="checkbox" data-metric="gt-power"> GT Power</label>
+                        <label class="check-row"><input type="checkbox" data-metric="rest-power"> Rest of Package</label>
                         <label class="check-row"><input type="checkbox" data-metric="fan" checked> Fan</label>
                     </div>
                 </div>
@@ -278,11 +280,12 @@
                         <div class="metric" data-metric-card="pl2-power" style="--accent:#fb923c" hidden><span class="metric-label">PL2</span><strong id="v-pl2-live" class="metric-value">-- W</strong></div>
                         <div class="metric" data-metric-card="ia-power" style="--accent:var(--data-ia)" hidden><span class="metric-label">IA Power</span><strong id="v-ia-power" class="metric-value">-- W</strong></div>
                         <div class="metric" data-metric-card="gt-power" style="--accent:var(--data-gt)" hidden><span class="metric-label">GT Power</span><strong id="v-gt-power" class="metric-value">-- W</strong></div>
+                        <div class="metric" data-metric-card="rest-power" style="--accent:#60a5fa" title="Package − IA − GT" hidden><span class="metric-label">Rest of Package</span><strong id="v-rest-power" class="metric-value">-- W</strong></div>
                         <div class="metric" data-metric-card="fan" style="--accent:var(--data-fan)"><span class="metric-label">Fan Speed (RPM)</span><strong id="v-fan" class="metric-value">--</strong></div>
                     </div>
                 </div>
                 <div class="panel" data-chart-panel="temperature"><div class="panel-header"><h3 class="panel-title">🌡 Live Temperature Chart (°C)</h3></div><div class="chart-wrap"><canvas id="trendChart"></canvas></div><div class="legend" id="temperature-chart-legend"></div></div>
-                <div class="panel" data-chart-panel="power"><div class="panel-header"><h3 class="panel-title">⚡ Live Power Chart (W)</h3></div><div class="chart-wrap"><canvas id="powerChart"></canvas></div><div class="legend"><span class="legend-item legend-package" data-power-legend="package-power">Package</span><span class="legend-item legend-pl1" data-power-legend="pl1-power">PL1</span><span class="legend-item legend-pl2" data-power-legend="pl2-power">PL2</span><span class="legend-item legend-ia" data-power-legend="ia-power">IA</span><span class="legend-item legend-gt" data-power-legend="gt-power">GT</span></div></div>
+                <div class="panel" data-chart-panel="power"><div class="panel-header"><h3 class="panel-title">⚡ Live Power Chart (W)</h3></div><div class="chart-wrap"><canvas id="powerChart"></canvas></div><div class="legend"><span class="legend-item legend-package" data-power-legend="package-power">Package</span><span class="legend-item legend-pl1" data-power-legend="pl1-power">PL1</span><span class="legend-item legend-pl2" data-power-legend="pl2-power">PL2</span><span class="legend-item legend-ia" data-power-legend="ia-power">IA</span><span class="legend-item legend-gt" data-power-legend="gt-power">GT</span><span class="legend-item" style="color:#60a5fa" data-power-legend="rest-power">Rest</span></div></div>
                 <div class="panel" id="geekbench-result" hidden>
                     <div class="panel-header"><h3 class="panel-title">🏁 Geekbench Result</h3><span class="panel-note" id="geekbench-state">Idle</span></div>
                     <div class="gb-progress" id="geekbench-progress"></div>

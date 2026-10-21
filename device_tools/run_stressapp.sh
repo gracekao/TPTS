@@ -2,9 +2,196 @@
 
 # ==============================================================================
 # Script: run_stressapp.sh
-# Description: Final bulletproof telemetry driver with MSR 0x19C temperature decoding.
+# Description: Final bulletproof telemetry driver with MSR 0x1B1 package temperature decoding.
 # Usage: ./run_stressapp.sh [duration_in_seconds] [run_stressapptest: 0|1]
 # ==============================================================================
+
+# Android mksh arithmetic is 32-bit signed, so keep timestamps relative and convert counters in awk.
+rapl_time_ms() {
+    awk -v base="${RAPL_TIME_BASE:-0}" '{ printf "%.0f\n", ($1 - base) * 1000 }' /proc/uptime
+}
+
+rapl_u32() {
+    awk -v value="$1" 'BEGIN { if (value < 0) value += 4294967296; printf "%.0f\n", value }'
+}
+
+rapl_power_mw() {
+    awk -v current="$1" -v previous="$2" -v elapsed="$3" -v range="$4" -v scale="$5" -v divisor="$6" 'BEGIN {
+        if (current !~ /^[0-9]+$/ || previous !~ /^[0-9]+$/) { print "NA missing"; exit }
+        if (elapsed <= 0) { print "NA invalid_time"; exit }
+        if (scale <= 0 || divisor <= 0) { print "NA invalid_unit"; exit }
+        if (range > 0 && (current > range || previous > range)) { print "NA invalid_counter"; exit }
+        delta = current - previous
+        status = "ok"
+        if (delta < 0) {
+            if (range > 0 && previous >= range * 0.75 && current <= range * 0.25) {
+                delta += range
+                status = "wrap"
+            } else { print "NA reset"; exit }
+        }
+        printf "%.0f %s\n", delta * scale / divisor / elapsed, status
+    }'
+}
+
+rapl_delta_uj() {
+    awk -v current="$1" -v previous="$2" -v range="$3" -v scale="$4" -v divisor="$5" 'BEGIN {
+        if (current !~ /^[0-9]+$/ || previous !~ /^[0-9]+$/) { print "NA missing"; exit }
+        if (scale <= 0 || divisor <= 0) { print "NA invalid_unit"; exit }
+        if (range > 0 && (current > range || previous > range)) { print "NA invalid_counter"; exit }
+        delta = current - previous
+        status = "ok"
+        if (delta < 0) {
+            if (range > 0 && previous >= range * 0.75 && current <= range * 0.25) {
+                delta += range
+                status = "wrap"
+            } else { print "NA reset"; exit }
+        }
+        printf "%.0f %s\n", delta * scale / divisor, status
+    }'
+}
+
+# Some platforms reset the package counter every few seconds, so integrate short valid intervals.
+rapl_pkg_window_step() {
+    rapl_read_domain "$ENERGY_PATH" 0x611
+    if [ -n "$RAPL_WIN_SOURCE" ]; then
+        if [ "$RAPL_SOURCE" != "$RAPL_WIN_SOURCE" ] || [ "$RAPL_UNIT" != "$RAPL_WIN_UNIT" ] || [ "$RAPL_TIME" -le "$RAPL_WIN_TIME" ]; then
+            set -- NA skipped
+        else
+            set -- $(rapl_delta_uj "$RAPL_ENERGY" "$RAPL_WIN_PREV" "$RAPL_RANGE" "$RAPL_SCALE" "$RAPL_DIVISOR")
+        fi
+        if [ "$1" = NA ]; then
+            RAPL_WIN_SKIPPED=$((RAPL_WIN_SKIPPED + 1))
+        else
+            RAPL_WIN_UJ=$((RAPL_WIN_UJ + $1))
+            RAPL_WIN_MS=$((RAPL_WIN_MS + RAPL_TIME - RAPL_WIN_TIME))
+            [ "$2" = wrap ] && RAPL_WIN_WRAP=1
+        fi
+    fi
+    RAPL_WIN_PREV=$RAPL_ENERGY RAPL_WIN_TIME=$RAPL_TIME
+    RAPL_WIN_SOURCE=$RAPL_SOURCE RAPL_WIN_UNIT=$RAPL_UNIT
+}
+
+rapl_wait() {
+    rapl_wait_end=$(($(rapl_time_ms) + $1 * 1000))
+    while [ "$(rapl_time_ms)" -lt "$rapl_wait_end" ]; do
+        sleep 0.1
+        rapl_pkg_window_step
+    done
+}
+
+rapl_init() {
+    read RAPL_TIME_BASE rapl_uptime_rest < /proc/uptime
+    RAPL_WIN_PREV= RAPL_WIN_TIME= RAPL_WIN_SOURCE= RAPL_WIN_UNIT= RAPL_WIN_FIRST= RAPL_WIN_START=
+    RAPL_WIN_UJ=0 RAPL_WIN_MS=0 RAPL_WIN_SKIPPED=0 RAPL_WIN_WRAP=
+    RAPL_PKG_PREV= RAPL_IA_PREV= RAPL_GT_PREV=
+    RAPL_PKG_TIME= RAPL_IA_TIME= RAPL_GT_TIME=
+    RAPL_PKG_SOURCE= RAPL_IA_SOURCE= RAPL_GT_SOURCE=
+    RAPL_PKG_UNIT= RAPL_IA_UNIT= RAPL_GT_UNIT=
+    ENERGY_PATH=/sys/class/powercap/intel-rapl/intel-rapl:0
+    IA_ENERGY_PATH= GT_ENERGY_PATH=
+    for rapl_path in "$ENERGY_PATH":*; do
+        [ -r "$rapl_path/energy_uj" ] || continue
+        case "$(cat "$rapl_path/name" 2>/dev/null)" in
+            core|pp0) IA_ENERGY_PATH=$rapl_path ;;
+            gt|graphics|pp1) GT_ENERGY_PATH=$rapl_path ;;
+        esac
+    done
+}
+
+rapl_read_domain() {
+    RAPL_ENERGY= RAPL_SOURCE=NA RAPL_RANGE=0 RAPL_SCALE=1 RAPL_DIVISOR=1 RAPL_UNIT=uj
+    RAPL_READ_START=$(rapl_time_ms)
+    if [ -n "$1" ]; then
+        RAPL_ENERGY=$(cat "$1/energy_uj" 2>/dev/null)
+    fi
+    case "$RAPL_ENERGY" in
+        ''|*[!0-9]*)
+            RAPL_ENERGY=
+            RAPL_RAW=$(/data/local/tmp/iotools rdmsr 0 "$2" 2>/dev/null)
+            RAPL_UNIT_RAW=$(/data/local/tmp/iotools rdmsr 0 0x606 2>/dev/null)
+            case "$RAPL_RAW:$RAPL_UNIT_RAW" in
+                *[!0-9a-fA-Fx:]*|:*|*:|0x:*|*:0x) ;;
+                0x*:0x*)
+                    RAPL_ENERGY=$(rapl_u32 $((RAPL_RAW & 0xFFFFFFFF)))
+                    RAPL_EXPONENT=$(((RAPL_UNIT_RAW >> 8) & 0x1F))
+                    RAPL_SOURCE=msr:$2
+                    RAPL_RANGE=4294967296
+                    RAPL_SCALE=1000000
+                    RAPL_DIVISOR=$((1 << RAPL_EXPONENT))
+                    RAPL_UNIT=ticks_2^-$RAPL_EXPONENT
+                    ;;
+            esac
+            ;;
+        *)
+            RAPL_SOURCE=$1/energy_uj
+            RAPL_RANGE=$(cat "$1/max_energy_range_uj" 2>/dev/null)
+            case "$RAPL_RANGE" in ''|*[!0-9]*) RAPL_RANGE=0 ;; esac
+            ;;
+    esac
+    RAPL_READ_END=$(rapl_time_ms)
+    RAPL_TIME=$(((RAPL_READ_START + RAPL_READ_END) / 2))
+}
+
+rapl_collect() {
+    RAPL_WIN_HAD_PREV=$RAPL_WIN_SOURCE
+    rapl_pkg_window_step
+    PKG_POWER_MW=NA
+    if [ "$RAPL_WIN_MS" -gt 0 ]; then
+        PKG_POWER_MW=$(((RAPL_WIN_UJ + RAPL_WIN_MS / 2) / RAPL_WIN_MS))
+        RAPL_STATUS=ok
+        [ -n "$RAPL_WIN_WRAP" ] && RAPL_STATUS=wrap
+        [ "$RAPL_WIN_SKIPPED" -gt 0 ] && RAPL_STATUS=partial:$RAPL_WIN_SKIPPED/${RAPL_WIN_MS}ms
+    elif [ -z "$RAPL_WIN_HAD_PREV" ]; then
+        RAPL_STATUS=first_sample
+    elif [ -z "$RAPL_ENERGY" ]; then
+        RAPL_STATUS=missing
+    else
+        RAPL_STATUS=reset
+    fi
+    echo "RAPL_SAMPLE: DOMAIN=package SOURCE=$RAPL_SOURCE E1=${RAPL_WIN_FIRST:-NA} E2=${RAPL_ENERGY:-NA} T1_MS=${RAPL_WIN_START:-NA} T2_MS=$RAPL_TIME RANGE=$RAPL_RANGE UNIT=$RAPL_UNIT STATUS=$RAPL_STATUS"
+    RAPL_CSV="$RAPL_SOURCE,${RAPL_WIN_FIRST:-NA},${RAPL_ENERGY:-NA},${RAPL_WIN_START:-NA},$RAPL_TIME,$RAPL_RANGE,$RAPL_UNIT,$RAPL_STATUS"
+    RAPL_WIN_FIRST=$RAPL_ENERGY RAPL_WIN_START=$RAPL_TIME
+    RAPL_WIN_UJ=0 RAPL_WIN_MS=0 RAPL_WIN_SKIPPED=0 RAPL_WIN_WRAP=
+    for rapl_domain in ia gt; do
+        case "$rapl_domain" in
+            ia) set -- "$IA_ENERGY_PATH" 0x639 "$RAPL_IA_PREV" "$RAPL_IA_TIME" "$RAPL_IA_SOURCE" "$RAPL_IA_UNIT" ;;
+            gt) set -- "$GT_ENERGY_PATH" 0x641 "$RAPL_GT_PREV" "$RAPL_GT_TIME" "$RAPL_GT_SOURCE" "$RAPL_GT_UNIT" ;;
+        esac
+        RAPL_PREVIOUS=$3
+        RAPL_PREVIOUS_TIME=$4
+        RAPL_PREVIOUS_SOURCE=$5
+        RAPL_PREVIOUS_UNIT=$6
+        rapl_read_domain "$1" "$2"
+        RAPL_ELAPSED=0
+        [ -n "$RAPL_PREVIOUS_TIME" ] && RAPL_ELAPSED=$((RAPL_TIME - RAPL_PREVIOUS_TIME))
+        if [ "$RAPL_PREVIOUS_SOURCE" != "$RAPL_SOURCE" ] || [ "$RAPL_PREVIOUS_UNIT" != "$RAPL_UNIT" ]; then
+            RAPL_RESULT="NA source_change"
+        else
+            RAPL_RESULT=$(rapl_power_mw "$RAPL_ENERGY" "$RAPL_PREVIOUS" "$RAPL_ELAPSED" "$RAPL_RANGE" "$RAPL_SCALE" "$RAPL_DIVISOR")
+        fi
+        set -- $RAPL_RESULT
+        RAPL_MW=$1
+        RAPL_STATUS=$2
+        [ -n "$RAPL_PREVIOUS_SOURCE" ] || RAPL_STATUS=first_sample
+        [ -n "$RAPL_ENERGY" ] || RAPL_STATUS=missing
+        echo "RAPL_SAMPLE: DOMAIN=$rapl_domain SOURCE=$RAPL_SOURCE E1=${RAPL_PREVIOUS:-NA} E2=${RAPL_ENERGY:-NA} T1_MS=${RAPL_PREVIOUS_TIME:-NA} T2_MS=$RAPL_TIME RANGE=$RAPL_RANGE UNIT=$RAPL_UNIT STATUS=$RAPL_STATUS"
+        RAPL_CSV="${RAPL_CSV:+$RAPL_CSV,}$RAPL_SOURCE,${RAPL_PREVIOUS:-NA},${RAPL_ENERGY:-NA},${RAPL_PREVIOUS_TIME:-NA},$RAPL_TIME,$RAPL_RANGE,$RAPL_UNIT,$RAPL_STATUS"
+        case "$rapl_domain" in
+            ia) IA_POWER_MW=$RAPL_MW; RAPL_IA_PREV=$RAPL_ENERGY; RAPL_IA_TIME=$RAPL_TIME; RAPL_IA_SOURCE=$RAPL_SOURCE; RAPL_IA_UNIT=$RAPL_UNIT ;;
+            gt) GT_POWER_MW=$RAPL_MW; RAPL_GT_PREV=$RAPL_ENERGY; RAPL_GT_TIME=$RAPL_TIME; RAPL_GT_SOURCE=$RAPL_SOURCE; RAPL_GT_UNIT=$RAPL_UNIT ;;
+        esac
+    done
+    PKG_POWER=NA
+    [ "$PKG_POWER_MW" = NA ] || PKG_POWER=$(awk -v mw="$PKG_POWER_MW" 'BEGIN { printf "%.6f", mw / 1000 }')
+}
+
+if [ "$1" = "--rapl-sample" ]; then
+    rapl_init
+    rapl_collect >/dev/null
+    rapl_wait 1
+    rapl_collect
+    return 0 2>/dev/null || exit 0
+fi
 
 DURATION_SEC=$1
 RUN_STRESSAPP=${2:-1}
@@ -15,42 +202,14 @@ if [ -z "$DURATION_SEC" ]; then
 fi
 
 LOG_FILE="/data/local/tmp/msr_log.csv"
-echo "Timestamp,MSR_0x610,MSR_0x64F,MSR_0x6B0,SoC_Temp_C,PKG_Power_W,Throttling_Flags" > "$LOG_FILE"
-PREV_RAPL_ENERGY=""
-RAPL_ENERGY_UNIT=""
-IA_ENERGY_PATH=""
-GT_ENERGY_PATH=""
-PREV_IA_ENERGY=""
-PREV_GT_ENERGY=""
-PREV_IA_MSR_ENERGY=""
-PREV_GT_MSR_ENERGY=""
-PREV_DOMAIN_TIME=""
-
-for domain in /sys/class/powercap/intel-rapl/intel-rapl:0:*; do
-    [ -f "$domain/energy_uj" ] || continue
-    domain_name=$(cat "$domain/name" 2>/dev/null)
-    case "$domain_name" in
-        core|pp0) IA_ENERGY_PATH="$domain" ;;
-        gt|graphics|pp1) GT_ENERGY_PATH="$domain" ;;
-    esac
+RAPL_HEADER=
+for rapl_domain in package ia gt; do
+    for rapl_field in source energy_before energy_after time_before_ms time_after_ms range unit status; do
+        RAPL_HEADER="${RAPL_HEADER:+$RAPL_HEADER,}${rapl_domain}_${rapl_field}"
+    done
 done
-
-echo "RAPL_SYSFS_DOMAINS: IA=${IA_ENERGY_PATH:-NA} GT=${GT_ENERGY_PATH:-NA}"
-
-domain_power_mw() {
-    current=$1
-    previous=$2
-    domain_path=$3
-    elapsed=$4
-    [ -n "$current" ] && [ -n "$previous" ] && [ "$elapsed" -gt 0 ] || { echo NA; return; }
-    delta=$((current - previous))
-    if [ "$delta" -lt 0 ]; then
-        range=$(cat "$domain_path/max_energy_range_uj" 2>/dev/null)
-        [ -n "$range" ] || { echo NA; return; }
-        delta=$((delta + range))
-    fi
-    echo $((delta / elapsed / 1000))
-}
+echo "Timestamp,MSR_0x610,MSR_0x64F,MSR_0x6B0,SoC_Temp_C,PKG_Power_W,Throttling_Flags,$RAPL_HEADER" > "$LOG_FILE"
+rapl_init
 
 run_telemetry_tick() {
     # --------------------------------------------------------------------------
@@ -59,96 +218,18 @@ run_telemetry_tick() {
     VAL_610=$(/data/local/tmp/iotools rdmsr 0 0x610 2>/dev/null)
     VAL_64F=$(/data/local/tmp/iotools rdmsr 0 0x64F 2>/dev/null)
     VAL_6B0=$(/data/local/tmp/iotools rdmsr 0 0x6B0 2>/dev/null)
-    VAL_19C=$(/data/local/tmp/iotools rdmsr 0 0x19C 2>/dev/null)
+    VAL_1B1=$(/data/local/tmp/iotools rdmsr 0 0x1B1 2>/dev/null)
+    VAL_1A2=$(/data/local/tmp/iotools rdmsr 0 0x1A2 2>/dev/null)
 
     [ -z "$VAL_610" ] && VAL_610="0x00000000"
     [ -z "$VAL_64F" ] && VAL_64F="0x00000000"
     [ -z "$VAL_6B0" ] && VAL_6B0="0x00000000"
-    [ -z "$VAL_19C" ] && VAL_19C="0x00000000"
+    [ -z "$VAL_1B1" ] && VAL_1B1="0x00000000"
 
     # --------------------------------------------------------------------------
     # 1.5 READ ENERGY FROM INTEL RAPL
     # --------------------------------------------------------------------------
-    ENERGY_PATH="/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj"
-    CURRENT_ENERGY=0
-    PKG_POWER=0
-    PKG_POWER_MW=0
-    DOMAIN_TIME=$(date +%s)
-    ELAPSED_DOMAIN_SECONDS=0
-    [ -n "$PREV_DOMAIN_TIME" ] && ELAPSED_DOMAIN_SECONDS=$((DOMAIN_TIME - PREV_DOMAIN_TIME))
-    IA_ENERGY=""
-    GT_ENERGY=""
-    [ -n "$IA_ENERGY_PATH" ] && IA_ENERGY=$(cat "$IA_ENERGY_PATH/energy_uj" 2>/dev/null)
-    [ -n "$GT_ENERGY_PATH" ] && GT_ENERGY=$(cat "$GT_ENERGY_PATH/energy_uj" 2>/dev/null)
-    IA_POWER_MW=$(domain_power_mw "$IA_ENERGY" "$PREV_IA_ENERGY" "$IA_ENERGY_PATH" "$ELAPSED_DOMAIN_SECONDS")
-    GT_POWER_MW=$(domain_power_mw "$GT_ENERGY" "$PREV_GT_ENERGY" "$GT_ENERGY_PATH" "$ELAPSED_DOMAIN_SECONDS")
-    PREV_IA_ENERGY=$IA_ENERGY
-    PREV_GT_ENERGY=$GT_ENERGY
-    PREV_DOMAIN_TIME=$DOMAIN_TIME
-
-    if [ "$IA_POWER_MW" = "NA" ] || [ "$GT_POWER_MW" = "NA" ]; then
-        if [ -z "$RAPL_ENERGY_UNIT" ]; then
-            RAPL_UNIT_RAW=$(/data/local/tmp/iotools rdmsr 0 0x606 2>/dev/null)
-            [ -n "$RAPL_UNIT_RAW" ] && RAPL_ENERGY_UNIT=$(( (RAPL_UNIT_RAW >> 8) & 0x1F ))
-        fi
-    fi
-
-    if [ "$IA_POWER_MW" = "NA" ] && [ -n "$RAPL_ENERGY_UNIT" ]; then
-        IA_MSR_RAW=$(/data/local/tmp/iotools rdmsr 0 0x639 2>/dev/null)
-        if [ -n "$IA_MSR_RAW" ]; then
-            CURRENT_IA_MSR_ENERGY=$(( IA_MSR_RAW & 0xFFFFFFFF ))
-            if [ -n "$PREV_IA_MSR_ENERGY" ] && [ "$ELAPSED_DOMAIN_SECONDS" -gt 0 ]; then
-                IA_MSR_DIFF=$(( CURRENT_IA_MSR_ENERGY - PREV_IA_MSR_ENERGY ))
-                [ "$IA_MSR_DIFF" -lt 0 ] && IA_MSR_DIFF=$(( IA_MSR_DIFF + 4294967296 ))
-                IA_POWER_MW=$(( IA_MSR_DIFF * 1000 / (1 << RAPL_ENERGY_UNIT) / ELAPSED_DOMAIN_SECONDS ))
-            fi
-            PREV_IA_MSR_ENERGY=$CURRENT_IA_MSR_ENERGY
-        fi
-    fi
-
-    if [ "$GT_POWER_MW" = "NA" ] && [ -n "$RAPL_ENERGY_UNIT" ]; then
-        GT_MSR_RAW=$(/data/local/tmp/iotools rdmsr 0 0x641 2>/dev/null)
-        if [ -n "$GT_MSR_RAW" ]; then
-            CURRENT_GT_MSR_ENERGY=$(( GT_MSR_RAW & 0xFFFFFFFF ))
-            if [ -n "$PREV_GT_MSR_ENERGY" ] && [ "$ELAPSED_DOMAIN_SECONDS" -gt 0 ]; then
-                GT_MSR_DIFF=$(( CURRENT_GT_MSR_ENERGY - PREV_GT_MSR_ENERGY ))
-                [ "$GT_MSR_DIFF" -lt 0 ] && GT_MSR_DIFF=$(( GT_MSR_DIFF + 4294967296 ))
-                GT_POWER_MW=$(( GT_MSR_DIFF * 1000 / (1 << RAPL_ENERGY_UNIT) / ELAPSED_DOMAIN_SECONDS ))
-            fi
-            PREV_GT_MSR_ENERGY=$CURRENT_GT_MSR_ENERGY
-        fi
-    fi
-    
-    if [ -f "$ENERGY_PATH" ]; then
-        CURRENT_ENERGY=$(cat "$ENERGY_PATH" 2>/dev/null)
-        if [ ! -z "$CURRENT_ENERGY" ] && [ ! -z "$PREV_ENERGY" ]; then
-            ENERGY_DIFF=$((CURRENT_ENERGY - PREV_ENERGY))
-            if [ $ENERGY_DIFF -lt 0 ]; then
-                ENERGY_DIFF=$((ENERGY_DIFF + 0x100000000))
-            fi
-            PKG_POWER=$((ENERGY_DIFF / 1000000))
-            PKG_POWER_MW=$((ENERGY_DIFF / 1000))
-        fi
-        PREV_ENERGY=$CURRENT_ENERGY
-    else
-        RAPL_UNIT_RAW=$(/data/local/tmp/iotools rdmsr 0 0x606 2>/dev/null)
-        RAPL_ENERGY_RAW=$(/data/local/tmp/iotools rdmsr 0 0x611 2>/dev/null)
-        if [ -n "$RAPL_UNIT_RAW" ] && [ -n "$RAPL_ENERGY_RAW" ]; then
-            if [ -z "$RAPL_ENERGY_UNIT" ]; then
-                RAPL_ENERGY_UNIT=$(( (RAPL_UNIT_RAW >> 8) & 0x1F ))
-            fi
-            CURRENT_RAPL_ENERGY=$(( RAPL_ENERGY_RAW & 0xFFFFFFFF ))
-            if [ -n "$PREV_RAPL_ENERGY" ]; then
-                ENERGY_DIFF=$(( CURRENT_RAPL_ENERGY - PREV_RAPL_ENERGY ))
-                if [ $ENERGY_DIFF -lt 0 ]; then
-                    ENERGY_DIFF=$(( ENERGY_DIFF + 4294967296 ))
-                fi
-                PKG_POWER_MW=$(( ENERGY_DIFF * 1000 / (1 << RAPL_ENERGY_UNIT) ))
-                PKG_POWER=$(( PKG_POWER_MW / 1000 ))
-            fi
-            PREV_RAPL_ENERGY=$CURRENT_RAPL_ENERGY
-        fi
-    fi
+    rapl_collect
 
     # --------------------------------------------------------------------------
     # 2. BULLETPROOF TEMPERATURE ACQUISITION
@@ -180,19 +261,17 @@ run_telemetry_tick() {
         SOC_TEMP=$((SOC_TEMP / 1000))
     fi
 
-    # Method B (THE ULTIMATE WEAPON): If sysfs fails or gives 0, decode MSR 0x19C!
+    # Method B: if sysfs fails, decode package DTS from MSR 0x1B1 relative to TjMax in MSR 0x1A2.
     if [ -z "$SOC_TEMP" ] || [ "$SOC_TEMP" -le 0 ] || [ "$SOC_TEMP" -gt 110 ] 2>/dev/null; then
-        if [ "$VAL_19C" != "0x00000000" ]; then
-            # Extract bits 22:16 from the hex string using pure bash arithmetic
-            DEC_19C=$(printf "%d" "$VAL_19C" 2>/dev/null)
-            if [ ! -z "$DEC_19C" ] && [ "$DEC_19C" -gt 0 ]; then
-                DIGITAL_READOUT=$(( (DEC_19C >> 16) & 0x7F ))
-                # Standard Intel Mobile Tcc Activation Target is 100C.
-                if [ "$DIGITAL_READOUT" -gt 0 ] && [ "$DIGITAL_READOUT" -lt 100 ]; then
-                    SOC_TEMP=$(( 100 - DIGITAL_READOUT ))
+        case "$VAL_1B1:$VAL_1A2" in
+            0x*:0x*)
+                TJMAX=$(( (VAL_1A2 >> 16) & 0xFF ))
+                DIGITAL_READOUT=$(( (VAL_1B1 >> 16) & 0x7F ))
+                if [ "$TJMAX" -gt 0 ] && [ "$DIGITAL_READOUT" -gt 0 ] && [ "$DIGITAL_READOUT" -lt "$TJMAX" ]; then
+                    SOC_TEMP=$(( TJMAX - DIGITAL_READOUT ))
                 fi
-            fi
-        fi
+                ;;
+        esac
     fi
 
     # Final absolute safety anchor line to prevent 0 flatlining
@@ -221,8 +300,8 @@ run_telemetry_tick() {
     # 3. INTERCEPT BIT ARRAYS FOR HARDWARE LIGHT LAMPS
     # --------------------------------------------------------------------------
     FLAGS="NONE"
-    if [ "$VAL_19C" != "0x00000000" ]; then
-        echo "MSR_STATUS_19C: ${VAL_19C}"
+    if [ "$VAL_1B1" != "0x00000000" ]; then
+        echo "MSR_1B1: ${VAL_1B1} MSR_1A2: ${VAL_1A2:-NA}"
     fi
 
     # --------------------------------------------------------------------------
@@ -244,8 +323,9 @@ run_telemetry_tick() {
     echo "PKG_POWER_MW: ${PKG_POWER_MW}"
     echo "IA_MW: ${IA_POWER_MW}"
     echo "GT_MW: ${GT_POWER_MW}"
+    echo "TPTS_POWER_SAMPLE_END"
     
-    echo "${TIMESTAMP},${VAL_610},${VAL_64F},${VAL_6B0},${SOC_TEMP},${PKG_POWER},${FLAGS}" >> "$LOG_FILE"
+    echo "${TIMESTAMP},${VAL_610},${VAL_64F},${VAL_6B0},${SOC_TEMP},${PKG_POWER},${FLAGS},${RAPL_CSV}" >> "$LOG_FILE"
 }
 
 # --------------------------------------------------------------------------
@@ -280,7 +360,7 @@ while [ $SECONDS -lt $END_TIME ] || { [ -e "$GB_FLAG" ] && [ $SECONDS -lt $MAX_E
     run_telemetry_tick
     echo -e "\n"
     [ $SECONDS -ge $END_TIME ] && [ ! -e "$GB_FLAG" ] && break
-    sleep 1
+    rapl_wait 1
 done
 
 [ -n "$STRESS_PID" ] && kill -9 "$STRESS_PID" >/dev/null 2>&1

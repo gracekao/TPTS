@@ -9,5 +9,11 @@
  "git.autofetch": true,
  "git.enableSmartCommit": true,
  "git.confirmSync": false,
- "git.postCommitCommand": "push"
+"git.postCommitCommand": "push",
+"chat.tools.terminal.autoApprove": {
+    "/^where\\.exe gh 2>&1; gh --version 2>&1; gh auth status 2>&1$/": {
+        "approve": true,
+        "matchCommandLine": true
+    }
+}
 }

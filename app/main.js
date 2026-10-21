@@ -46,6 +46,10 @@ const thermalZoneMetricKeys = new Map();
 const thermalZoneColors = ['#f472b6', '#a3e635', '#818cf8', '#facc15', '#2dd4bf', '#fb7185', '#c084fc'];
 let latestIaPower = null;
 let latestGtPower = null;
+let latestRestPower = null;
+let latestLimitReasons = null;
+let msrPowerUnitWatts = null;
+let msrTjMaxC = null;
 let latestCpuFreqGhz = null;
 let currentPowerLimitRegister = '';
 let currentPowerLimit4Register = '';
@@ -63,6 +67,9 @@ let telemetrySampler = null;
 let chartingActive = false;
 let telemetryHistoryReadyAt = 0;
 let telemetryDebugEnabled = false;
+let latestRaplSamples = {};
+let awaitingRaplSampleEnd = false;
+let telemetrySampleStartedAt = 0;
 let pendingChartTemperature = null;
 let pendingChartTimer = null;
 let pendingStructuredTemperature = null;
@@ -199,12 +206,21 @@ function captureTelemetryExportSelection() {
     if (isMetricEnabled('package-power')) selectedMetrics.push({ header: 'package_power_w', value: (row) => row.pkg });
     if (isMetricEnabled('ia-power')) selectedMetrics.push({ header: 'ia_power_w', value: (row) => row.ia });
     if (isMetricEnabled('gt-power')) selectedMetrics.push({ header: 'gt_power_w', value: (row) => row.gt });
+    if (isMetricEnabled('rest-power')) selectedMetrics.push({ header: 'rest_of_package_power_w', value: (row) => row.rest });
+    selectedMetrics.push({ header: 'cpu_limit_reasons', value: (row) => row.limitReasons?.active.join(';') });
+    selectedMetrics.push({ header: 'cpu_limit_reasons_logged', value: (row) => row.limitReasons?.logged.join(';') });
     thermalZoneMetricKeys.forEach((zone) => {
         if (isMetricEnabled(zone.metricKey)) {
             selectedMetrics.push({ header: `${zone.label}_c`, value: (row) => row.thermalZones?.[zone.metricKey] });
         }
     });
     if (isMetricEnabled('fan')) selectedMetrics.push({ type: 'fan' });
+    for (const [metric, domain] of [['package-power', 'package'], ['ia-power', 'ia'], ['gt-power', 'gt']]) {
+        if (!isMetricEnabled(metric)) continue;
+        for (const field of ['source', 'energy_before', 'energy_after', 'time_before_ms', 'time_after_ms', 'range', 'unit', 'status']) {
+            selectedMetrics.push({ header: `${domain}_${field}`, value: (row) => row.rapl?.[domain]?.[field] });
+        }
+    }
     return selectedMetrics;
 }
 
@@ -251,7 +267,7 @@ function syncDashboardMetrics() {
     const temperaturePanel = document.querySelector('[data-chart-panel="temperature"]');
     const temperatureMetrics = ['soc-temp', ...[...thermalZoneMetricKeys.values()].map((zone) => zone.metricKey)];
     if (temperaturePanel) temperaturePanel.hidden = !temperatureMetrics.some(isMetricEnabled);
-    const powerMetrics = ['package-power', 'pl1-power', 'pl2-power', 'ia-power', 'gt-power'];
+    const powerMetrics = ['package-power', 'pl1-power', 'pl2-power', 'ia-power', 'gt-power', 'rest-power'];
     const powerPanel = document.querySelector('[data-chart-panel="power"]');
     if (powerPanel) powerPanel.hidden = !powerMetrics.some(isMetricEnabled);
     document.querySelectorAll('[data-power-legend]').forEach((legend) => {
@@ -340,6 +356,35 @@ function renderFanSpeeds() {
     syncFanControlInputs();
 }
 
+// Bit layout of MSR_CORE_PERF_LIMIT_REASONS (0x64F), matching SDM Table 2-39 and PTAT naming.
+const CORE_LIMIT_REASON_BITS = [
+    [0, 'PROCHOT'], [1, 'THERMAL'], [4, 'RSR_LIMIT'], [5, 'RATL'], [6, 'VR_THERMALERT'], [7, 'VR_TDC'],
+    [8, 'OTHER'], [10, 'PBM_PL1'], [11, 'PBM_PL2'], [12, 'MAX_TURBO_LIMIT'], [13, 'TURBO_ATTEN']
+];
+const THERMAL_LIMIT_REASONS = new Set(['PROCHOT', 'THERMAL', 'RATL', 'VR_THERMALERT']);
+
+function decodeCoreLimitReasons(hexValue) {
+    if (!/^0x[0-9a-f]+$/i.test(hexValue || '')) return null;
+    const value = Number(BigInt(hexValue) & 0xFFFFFFFFn);
+    return {
+        raw: hexValue,
+        active: CORE_LIMIT_REASON_BITS.filter(([bit]) => (value >>> bit) & 1).map(([, name]) => name),
+        logged: CORE_LIMIT_REASON_BITS.filter(([bit]) => (value >>> (bit + 16)) & 1).map(([, name]) => name)
+    };
+}
+
+function renderRestPower(patchHistory) {
+    latestRestPower = null;
+    if ([latestPackagePower, latestIaPower, latestGtPower].every(Number.isFinite)) {
+        const rest = latestPackagePower - latestIaPower - latestGtPower;
+        // Small negatives come from IA/GT and Package being sampled at slightly different instants.
+        if (rest >= -0.05) latestRestPower = Math.round(Math.max(0, rest) * 100) / 100;
+    }
+    const restEl = document.getElementById('v-rest-power');
+    if (restEl) restEl.innerText = latestRestPower === null ? '-- W' : `${latestRestPower.toFixed(2)} W`;
+    if (patchHistory && restPowerHistory.length) restPowerHistory[restPowerHistory.length - 1] = latestRestPower;
+}
+
 function updateMonitorEvent(eventName, state, level = '') {
     const row = document.querySelector(`[data-event-row="${eventName}"]`);
     if (!row) return;
@@ -356,6 +401,13 @@ function updateMonitorEvents() {
     updateMonitorEvent('tcc', latestTcc ? 'ACTIVE' : 'OK', latestTcc ? 'active' : '');
     updateMonitorEvent('prochot', latestProchot ? 'ACTIVE' : 'OK', latestProchot ? 'active' : '');
     updateMonitorEvent('power', latestPowerLimit ? 'ACTIVE' : 'OK', latestPowerLimit ? 'active' : '');
+    const limitReasons = latestLimitReasons?.active || [];
+    updateMonitorEvent('clip', !latestLimitReasons ? '--' : limitReasons.length ? limitReasons.join(', ') : 'OK',
+        limitReasons.some((reason) => THERMAL_LIMIT_REASONS.has(reason)) ? 'active' : limitReasons.length ? 'warn' : '');
+    const clipRow = document.querySelector('[data-event-row="clip"]');
+    if (clipRow && latestLimitReasons) {
+        clipRow.title = `MSR 0x64F ${latestLimitReasons.raw}\nActive: ${limitReasons.join(', ') || 'Not Clipped'}\nLogged since last clear: ${latestLimitReasons.logged.join(', ') || 'None'}`;
+    }
     updateMonitorEvent('temperature', temp >= 92 ? 'CRITICAL' : temp >= 85 ? 'HIGH' : 'OK', temp >= 92 ? 'active' : temp >= 85 ? 'warn' : '');
     updateMonitorEvent('fan', fanStalled ? 'CHECK FAN' : detectedFanCount > 0 ? 'OK' : 'NOT DETECTED', fanStalled ? 'active' : detectedFanCount > 0 ? '' : 'warn');
     const telemetryAge = latestTelemetryAt ? Date.now() - latestTelemetryAt : Number.POSITIVE_INFINITY;
@@ -391,16 +443,32 @@ function tryAutoConnectLocal() {
     connectDevice();
 }
 
+function parseMsrUnits(rawLog) {
+    const unitMatch = rawLog.match(/MSR_606:\s*(0x[0-9a-fA-F]+)/i);
+    if (unitMatch) msrPowerUnitWatts = 1 / 2 ** Number(BigInt(unitMatch[1]) & 0xFn);
+    const targetMatch = rawLog.match(/MSR_1A2:\s*(0x[0-9a-fA-F]+)/i);
+    if (targetMatch) {
+        const tjMax = Number((BigInt(targetMatch[1]) >> 16n) & 0xFFn);
+        if (tjMax > 0) msrTjMaxC = tjMax;
+    }
+}
+
+function powerLimitStep() {
+    return msrPowerUnitWatts ?? 0.125;
+}
+
 function decodeAndRenderPLFrom610(hex610) {
     if (!hex610 || !hex610.startsWith('0x')) return;
+    currentPowerLimitRegister = hex610;
+    if (!msrPowerUnitWatts) return;
     let hexStr = hex610.substring(2).padStart(16, '0');
     let low32 = hexStr.substring(8);
     let high32 = hexStr.substring(0, 8);
 
     let pl1_raw = parseInt(low32, 16) & 0x7FFF;      // bit 0:14
     let pl2_raw = parseInt(high32, 16) & 0x7FFF;     // bit 32:46
-    let pl1_watts = pl1_raw * 0.125;
-    let pl2_watts = pl2_raw * 0.125;
+    let pl1_watts = pl1_raw * msrPowerUnitWatts;
+    let pl2_watts = pl2_raw * msrPowerUnitWatts;
 
     const pl1El = document.getElementById('v-pl1');
     const pl2El = document.getElementById('v-pl2');
@@ -415,37 +483,20 @@ function decodeAndRenderPLFrom610(hex610) {
     const pl2Card = document.getElementById('v-pl2-live');
     if (pl1Card) pl1Card.innerText = `${pl1Text} W`;
     if (pl2Card) pl2Card.innerText = `${pl2Text} W`;
-    currentPowerLimitRegister = hex610;
     if (v610) v610.innerText = hex610;
 
 }
 
 function decodeAndRenderPL4From601(hex601) {
     if (!hex601 || !hex601.startsWith('0x')) return;
+    currentPowerLimit4Register = hex601;
+    if (!msrPowerUnitWatts) return;
     let pl4_raw = parseInt(hex601, 16) & 0x1FFF;     // bit 0:12
-    let pl4_watts = pl4_raw * 0.125;
+    let pl4_watts = pl4_raw * msrPowerUnitWatts;
 
     const pl4El = document.getElementById('v-pl4');
     const pl4Text = formatPowerWatts(pl4_watts);
     if (pl4El) pl4El.innerText = `${pl4Text} W`;
-    currentPowerLimit4Register = hex601;
-}
-
-function decodeAndRenderPowerFrom64F(hex64F) {
-    if (!hex64F || !hex64F.startsWith('0x')) return null;
-    
-    let hexStr = hex64F.substring(2).padStart(16, '0');
-    let low32 = hexStr.substring(8);
-    let powerRaw = parseInt(low32, 16) & 0xFFFF;
-    let powerWatts = powerRaw * 0.125;
-    
-    const powerEl = document.getElementById('v-power');
-    if (powerEl) {
-        const powerText = powerWatts < 10 ? powerWatts.toFixed(2) : Math.round(powerWatts);
-        powerEl.innerText = `${powerText} W`;
-    }
-    
-    return powerWatts;
 }
 
 function sendAdb(args) {
@@ -741,7 +792,7 @@ function requestTuningDefaults(force = false) {
     if (!ipInput) return;
     const target = normalizeTarget(ipInput.value);
     if (!target) return;
-    const command = "su 0 sh -c 'v610=$(/data/local/tmp/iotools rdmsr 0 0x610 2>/dev/null); [ -z \"$v610\" ] && v610=$(/data/local/tmp/iotools rdmsr 0x610 2>/dev/null); v601=$(/data/local/tmp/iotools rdmsr 0 0x601 2>/dev/null); [ -z \"$v601\" ] && v601=$(/data/local/tmp/iotools rdmsr 0x601 2>/dev/null); defaults=/data/local/tmp/tpts_power_limit_defaults; created=0; case \"$v610\" in 0x[0-9A-Fa-f]*) valid610=1;; *) valid610=0;; esac; case \"$v601\" in 0x[0-9A-Fa-f]*) valid601=1;; *) valid601=0;; esac; if [ \"$valid610\" = 1 ] && [ \"$valid601\" = 1 ] && { [ ! -s \"$defaults\" ] || ! grep -q \"^MSR_610=0x[0-9A-Fa-f]\" \"$defaults\" || ! grep -q \"^MSR_601=0x[0-9A-Fa-f]\" \"$defaults\"; }; then printf \"MSR_610=%s\\nMSR_601=%s\\n\" \"$v610\" \"$v601\" > \"$defaults\"; created=1; fi; d610=$(sed -n \"s/^MSR_610=//p\" \"$defaults\" | head -n 1); d601=$(sed -n \"s/^MSR_601=//p\" \"$defaults\" | head -n 1); echo TPTS_TUNING_SYNC_BEGIN; echo MSR_610: ${v610:-NA}; echo MSR_601: ${v601:-NA}; echo TPTS_DEFAULT_610: ${d610:-NA}; echo TPTS_DEFAULT_601: ${d601:-NA}; echo TPTS_DEFAULTS_CREATED: $created; echo TPTS_TUNING_SYNC_END'";
+    const command = "su 0 sh -c 'v610=$(/data/local/tmp/iotools rdmsr 0 0x610 2>/dev/null); [ -z \"$v610\" ] && v610=$(/data/local/tmp/iotools rdmsr 0x610 2>/dev/null); v601=$(/data/local/tmp/iotools rdmsr 0 0x601 2>/dev/null); [ -z \"$v601\" ] && v601=$(/data/local/tmp/iotools rdmsr 0x601 2>/dev/null); defaults=/data/local/tmp/tpts_power_limit_defaults; created=0; case \"$v610\" in 0x[0-9A-Fa-f]*) valid610=1;; *) valid610=0;; esac; case \"$v601\" in 0x[0-9A-Fa-f]*) valid601=1;; *) valid601=0;; esac; if [ \"$valid610\" = 1 ] && [ \"$valid601\" = 1 ] && { [ ! -s \"$defaults\" ] || ! grep -q \"^MSR_610=0x[0-9A-Fa-f]\" \"$defaults\" || ! grep -q \"^MSR_601=0x[0-9A-Fa-f]\" \"$defaults\"; }; then printf \"MSR_610=%s\\nMSR_601=%s\\n\" \"$v610\" \"$v601\" > \"$defaults\"; created=1; fi; d610=$(sed -n \"s/^MSR_610=//p\" \"$defaults\" | head -n 1); d601=$(sed -n \"s/^MSR_601=//p\" \"$defaults\" | head -n 1); echo TPTS_TUNING_SYNC_BEGIN; echo MSR_606: $(/data/local/tmp/iotools rdmsr 0 0x606 2>/dev/null); echo MSR_1A2: $(/data/local/tmp/iotools rdmsr 0 0x1A2 2>/dev/null); echo MSR_610: ${v610:-NA}; echo MSR_601: ${v601:-NA}; echo TPTS_DEFAULT_610: ${d610:-NA}; echo TPTS_DEFAULT_601: ${d601:-NA}; echo TPTS_DEFAULTS_CREATED: $created; echo TPTS_TUNING_SYNC_END'";
     if (isLocalTarget(target)) {
         sendAdb(['shell', command]);
     } else {
@@ -951,6 +1002,8 @@ function resetLiveDeviceState() {
     latestPl2 = null;
     latestIaPower = null;
     latestGtPower = null;
+    latestRestPower = null;
+    latestLimitReasons = null;
     latestSocTemp = null;
     latestCpuFreqGhz = null;
     latestTcc = 0;
@@ -962,12 +1015,13 @@ function resetLiveDeviceState() {
     pl2PowerHistory.length = 0;
     iaPowerHistory.length = 0;
     gtPowerHistory.length = 0;
+    restPowerHistory.length = 0;
     powerFilterWindow.length = 0;
     lastUncoreEnergyUj = null;
     lastUncoreSampleMs = 0;
     drawChartGrid();
     drawPowerChartGrid();
-    ['v-temp', 'v-power', 'v-pl1-live', 'v-pl2-live', 'v-ia-power', 'v-gt-power'].forEach((id) => {
+    ['v-temp', 'v-power', 'v-pl1-live', 'v-pl2-live', 'v-ia-power', 'v-gt-power', 'v-rest-power'].forEach((id) => {
         const element = document.getElementById(id);
         if (element) element.innerText = id === 'v-fan' ? '--' : '-- W';
     });
@@ -1013,9 +1067,14 @@ function applyPowerLimits() {
         return;
     }
 
-    const pl1Raw = Math.round(pl1 / 0.125) & 0x7FFF;
-    const pl2Raw = Math.round(pl2 / 0.125) & 0x7FFF;
-    const pl4Raw = Math.round(pl4 / 0.125) & 0x1FFF;
+    const unit = msrPowerUnitWatts;
+    if (!unit) {
+        alert('Cannot read the RAPL power unit (MSR 0x606) yet. Wait for tuning values to sync.');
+        return;
+    }
+    const pl1Raw = Math.round(pl1 / unit) & 0x7FFF;
+    const pl2Raw = Math.round(pl2 / unit) & 0x7FFF;
+    const pl4Raw = Math.round(pl4 / unit) & 0x1FFF;
 
     const v610El = document.getElementById('v610');
     const base610Text = v610El ? v610El.innerText.trim() : currentPowerLimitRegister;
@@ -1651,9 +1710,12 @@ function startThermalPipeline() {
     }
     telemetrySampler = null;
     namedRaplActive = false;
+    latestRaplSamples = {};
+    awaitingRaplSampleEnd = false;
     latestIaPower = null;
     latestGtPower = null;
-    for (const id of ['v-ia-power', 'v-gt-power']) {
+    latestRestPower = null;
+    for (const id of ['v-ia-power', 'v-gt-power', 'v-rest-power']) {
         const element = document.getElementById(id);
         if (element) element.innerText = '-- W';
     }
@@ -1668,6 +1730,7 @@ function startThermalPipeline() {
         pl2PowerHistory.length = 0;
         iaPowerHistory.length = 0;
         gtPowerHistory.length = 0;
+        restPowerHistory.length = 0;
         powerFilterWindow.length = 0;
         filterWindow.length = 0;
         telemetryLog.length = 0;
@@ -1891,7 +1954,7 @@ function evaluateThermalTuneGuard() {
         const reason = emergency
             ? (latestProchot ? 'PROCHOT protection' : 'TCC thermal throttle')
             : `${trigger[0].toUpperCase()} ${trigger[0] === 'soc' ? `${windowSeconds}s average` : 'temperature'} reached ${thresholds[trigger[0]].toFixed(1)} C`;
-        const nextPl1 = Math.max(control.minimumPl1Watts, Math.round((currentPl1 - control.stepWatts) / 0.125) * 0.125);
+        const nextPl1 = Math.max(control.minimumPl1Watts, Math.round((currentPl1 - control.stepWatts) / powerLimitStep()) * powerLimitStep());
         adjustThermalTunePl1(nextPl1, reason, sources, now);
         if (statusEl) statusEl.innerText = `Auto Tune reduced PL1 after ${reason}. EC fan control remains automatic.`;
         return;
@@ -1907,7 +1970,7 @@ function evaluateThermalTuneGuard() {
     const stableForMs = now - thermalTuneStableSince;
     const startingPl1 = autoTuneDryRun.startingPl1;
     if (stableForMs >= control.settleSeconds * 1000 && cooldownElapsed && currentPl1 < startingPl1) {
-        const nextPl1 = Math.min(startingPl1, Math.round((currentPl1 + control.stepWatts) / 0.125) * 0.125);
+        const nextPl1 = Math.min(startingPl1, Math.round((currentPl1 + control.stepWatts) / powerLimitStep()) * powerLimitStep());
         adjustThermalTunePl1(nextPl1, `recovered below target for ${control.settleSeconds}s`, sources, now);
         if (statusEl) statusEl.innerText = `Auto Tune restored PL1 one step after ${control.settleSeconds}s below the recovery band.`;
     } else if (statusEl) {
@@ -2067,7 +2130,7 @@ function finishLegacyAutoTuneDryRun() {
     const currentPl2 = Number(document.getElementById('tune-pl2')?.value);
     const currentPl4 = Number(document.getElementById('tune-pl4')?.value);
     const adjustment = unsafe ? -1 : peakTempC > session.targetTempC ? -0.5 : peakTempC < session.targetTempC - 4 ? 0.5 : 0;
-    const recommendation = Number.isFinite(currentPl1) ? Math.max(0.125, Math.round((currentPl1 + adjustment) / 0.125) * 0.125) : null;
+    const recommendation = Number.isFinite(currentPl1) ? Math.max(powerLimitStep(), Math.round((currentPl1 + adjustment) / powerLimitStep()) * powerLimitStep()) : null;
     autoTuneResult = { schemaVersion: 1, profileName: `dry-run-${session.objective}-${new Date().toISOString().slice(0, 10)}`, source: 'tpts-auto-tune-dry-run', objective: session.objective, safety: { targetTempC: session.targetTempC, hardLimitC: session.hardLimitC, abortOnTcc: true, abortOnProchot: true }, controls: { pl1Watts: recommendation, pl2Watts: Number.isFinite(currentPl2) ? currentPl2 : null, pl4Watts: Number.isFinite(currentPl4) ? currentPl4 : null, fanMode: document.getElementById('tune-fan-mode')?.value || 'auto' }, measured: { samples: samples.length, durationSec: session.duration, averageTempC, peakTempC, averagePackagePowerW: averagePowerW, averageCpuFreqGhz, throttleSeconds }, recommendation: unsafe ? 'Reduce PL1 before the next test; do not apply this result automatically.' : adjustment > 0 ? 'Thermal headroom remains. Test a small PL1 increase next.' : adjustment < 0 ? 'Target temperature was exceeded. Test a small PL1 reduction next.' : 'Current PL1 is within the target temperature band.' };
     const resultPanel = document.getElementById('auto-tune-result');
     const summaryText = document.getElementById('auto-tune-summary');
@@ -2185,6 +2248,7 @@ function startLiveTelemetry() {
         pl2PowerHistory.length = 0;
         iaPowerHistory.length = 0;
         gtPowerHistory.length = 0;
+        restPowerHistory.length = 0;
         powerFilterWindow.length = 0;
         filterWindow.length = 0;
         telemetryLog.length = 0;
@@ -2204,6 +2268,10 @@ function startLiveTelemetryLoop(resetHistory = false) {
         clearInterval(monitorTimer);
     }
     monitorTimer = null; 
+    namedRaplActive = false;
+    latestRaplSamples = {};
+    awaitingRaplSampleEnd = false;
+    telemetrySampleStartedAt = 0;
     
     if (resetHistory) {
         clearTemperatureHistories();
@@ -2212,6 +2280,7 @@ function startLiveTelemetryLoop(resetHistory = false) {
         pl2PowerHistory.length = 0;
         iaPowerHistory.length = 0;
         gtPowerHistory.length = 0;
+        restPowerHistory.length = 0;
         powerFilterWindow.length = 0;
         filterWindow.length = 0;
         telemetryLog.length = 0;
@@ -2240,24 +2309,39 @@ function startLiveTelemetryLoop(resetHistory = false) {
     telemetrySampler = () => {
         const target = normalizeTarget(document.getElementById('ip') ? document.getElementById('ip').value : '');
         if (!target) return;
-        let megaCommand = `su 0 sh -c 'temp_value=; for z in /sys/class/thermal/thermal_zone*; do t=\$(cat \$z/type 2>/dev/null); if [ "\$t" = "x86_pkg_temp" ]; then temp_value=\$(cat \$z/temp 2>/dev/null); break; fi; done; if [ -z "\$temp_value" ] && [ -f /sys/class/thermal/thermal_zone0/temp ]; then temp_value=\$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null); fi; freq_value=; f=/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq; [ -f "\$f" ] && freq_value=\$(cat "\$f" 2>/dev/null); fan_count=\$(ectool pwmgetnumfans 2>/dev/null | sed -n "s/.*= *//p"); fan_values=; if [ -n "\$fan_count" ]; then fan_values=\$(ectool pwmgetfanrpm 2>/dev/null | sed -n "s/.*RPM: *//p" | tr "\\n" ","); else fan_count=0; for fan in /sys/class/hwmon/hwmon*/fan*_input; do if [ -f "\$fan" ]; then rpm=\$(cat "\$fan" 2>/dev/null); if [ -n "\$rpm" ]; then fan_values="\${fan_values:+\$fan_values,}\$rpm"; fan_count=\$((fan_count + 1)); fi; fi; done; fi; power_mw=; ia_mw=; gt_mw=; p=/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj; m=/sys/class/powercap/intel-rapl/intel-rapl:0/max_energy_range_uj; iap=/sys/class/powercap/intel-rapl/intel-rapl:0/intel-rapl:0:0/energy_uj; gtp=/sys/class/powercap/intel-rapl/intel-rapl:0/intel-rapl:0:1/energy_uj; if [ -f "\$p" ]; then e1=\$(cat "\$p" 2>/dev/null); ia1=; [ -f "\$iap" ] && ia1=\$(cat "\$iap" 2>/dev/null); gt1=; [ -f "\$gtp" ] && gt1=\$(cat "\$gtp" 2>/dev/null); sleep 1; e2=\$(cat "\$p" 2>/dev/null); ia2=; [ -f "\$iap" ] && ia2=\$(cat "\$iap" 2>/dev/null); gt2=; [ -f "\$gtp" ] && gt2=\$(cat "\$gtp" 2>/dev/null); if [ -n "\$e1" ] && [ -n "\$e2" ]; then d=\$((e2 - e1)); if [ \$d -lt 0 ]; then mx=\$(cat "\$m" 2>/dev/null); [ -n "\$mx" ] && d=\$((d + mx)); fi; power_mw=\$((d / 1000)); fi; if [ -n "\$ia1" ] && [ -n "\$ia2" ]; then dia=\$((ia2 - ia1)); [ \$dia -lt 0 ] && dia=0; ia_mw=\$((dia / 1000)); fi; if [ -n "\$gt1" ] && [ -n "\$gt2" ]; then dgt=\$((gt2 - gt1)); [ \$dgt -lt 0 ] && dgt=0; gt_mw=\$((dgt / 1000)); fi; fi; echo "TPTS_SAMPLE: TARGET_SYSFS_TEMP: \${temp_value:-NA} CPU_FREQ_KHZ: \${freq_value:-NA} FAN_COUNT: \${fan_count:-0} FAN_RPMS: \${fan_values:-NA} PKG_POWER_MW: \${power_mw:-NA} IA_MW: \${ia_mw:-NA} GT_MW: \${gt_mw:-NA} MSR_19C: \$(/data/local/tmp/iotools rdmsr 0 0x19C 2>/dev/null) MSR_610: \$(/data/local/tmp/iotools rdmsr 0 0x610 2>/dev/null) MSR_601: \$(/data/local/tmp/iotools rdmsr 0 0x601 2>/dev/null) MSR_64F: \$(/data/local/tmp/iotools rdmsr 0 0x64F 2>/dev/null) MSR_6B0: \$(/data/local/tmp/iotools rdmsr 0 0x6B0 2>/dev/null)"'`;
+        if (telemetrySampleStartedAt && Date.now() - telemetrySampleStartedAt < 10000) return;
+        telemetrySampleStartedAt = Date.now();
+        let megaCommand = `su 0 sh -c '
+temp_value=
+for z in /sys/class/thermal/thermal_zone*; do
+    t=$(cat "$z/type" 2>/dev/null)
+    if [ "$t" = "x86_pkg_temp" ]; then temp_value=$(cat "$z/temp" 2>/dev/null); break; fi
+done
+if [ -z "$temp_value" ] && [ -f /sys/class/thermal/thermal_zone0/temp ]; then temp_value=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null); fi
+freq_value=
+f=/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq
+[ -f "$f" ] && freq_value=$(cat "$f" 2>/dev/null)
+fan_count=$(ectool pwmgetnumfans 2>/dev/null | sed -n "s/.*= *//p")
+fan_values=
+if [ -n "$fan_count" ]; then
+    fan_values=$(ectool pwmgetfanrpm 2>/dev/null | sed -n "s/.*RPM: *//p" | tr "\\n" ",")
+else
+    fan_count=0
+    for fan in /sys/class/hwmon/hwmon*/fan*_input; do
+        [ -f "$fan" ] || continue
+        rpm=$(cat "$fan" 2>/dev/null)
+        if [ -n "$rpm" ]; then fan_values="\${fan_values:+$fan_values,}$rpm"; fan_count=$((fan_count + 1)); fi
+    done
+fi
+PKG_POWER_MW=NA IA_POWER_MW=NA GT_POWER_MW=NA
+if grep -q "^rapl_collect()" /data/local/tmp/run_stressapp.sh 2>/dev/null; then
+    set -- --rapl-sample
+    . /data/local/tmp/run_stressapp.sh
+else
+    echo TPTS_RAPL_UPDATE_REQUIRED
+fi
+echo "TPTS_SAMPLE: TARGET_SYSFS_TEMP: \${temp_value:-NA} CPU_FREQ_KHZ: \${freq_value:-NA} FAN_COUNT: \${fan_count:-0} FAN_RPMS: \${fan_values:-NA} PKG_POWER_MW: $PKG_POWER_MW IA_MW: $IA_POWER_MW GT_MW: $GT_POWER_MW MSR_606: $(/data/local/tmp/iotools rdmsr 0 0x606 2>/dev/null) MSR_1A2: $(/data/local/tmp/iotools rdmsr 0 0x1A2 2>/dev/null) MSR_1B1: $(/data/local/tmp/iotools rdmsr 0 0x1B1 2>/dev/null) MSR_610: $(/data/local/tmp/iotools rdmsr 0 0x610 2>/dev/null) MSR_601: $(/data/local/tmp/iotools rdmsr 0 0x601 2>/dev/null) MSR_64F: $(/data/local/tmp/iotools rdmsr 0 0x64F 2>/dev/null) MSR_6B0: $(/data/local/tmp/iotools rdmsr 0 0x6B0 2>/dev/null)"'`;
         const thermalZoneSampleSuffix = '; for z in /sys/class/thermal/thermal_zone*; do [ -d "$z" ] || continue; index=${z##*thermal_zone}; type=$(cat "$z/type" 2>/dev/null | tr "[:space:]" "_"); temp=$(cat "$z/temp" 2>/dev/null); [ -n "$type" ] && [ -n "$temp" ] && echo TPTS_THERMAL_ZONE: $index:$type:$temp; done; echo TPTS_SAMPLE_END';
-        megaCommand = megaCommand.replace(
-            'iap=/sys/class/powercap/intel-rapl/intel-rapl:0/intel-rapl:0:0/energy_uj; gtp=/sys/class/powercap/intel-rapl/intel-rapl:0/intel-rapl:0:1/energy_uj;',
-            'iap=; gtp=; for domain in /sys/class/powercap/intel-rapl/intel-rapl:0:*; do [ -f "$domain/energy_uj" ] || continue; domain_name=$(cat "$domain/name" 2>/dev/null); case "$domain_name" in core|pp0) iap="$domain/energy_uj" ;; gt|graphics|pp1) gtp="$domain/energy_uj" ;; esac; done;'
-        );
-        megaCommand = megaCommand.replace(
-            'sleep 1;',
-            'rapl_unit=; ia_msr_e1=; gt_msr_e1=; if [ -z "$ia1" ] || [ -z "$gt1" ]; then rapl_unit=$(/data/local/tmp/iotools rdmsr 0 0x606 2>/dev/null); fi; if [ -z "$ia1" ]; then ia_msr_e1=$(/data/local/tmp/iotools rdmsr 0 0x639 2>/dev/null); fi; if [ -z "$gt1" ]; then gt_msr_e1=$(/data/local/tmp/iotools rdmsr 0 0x641 2>/dev/null); fi; sleep 1;'
-        );
-        megaCommand = megaCommand.replace(
-            'gt2=$(cat "$gtp" 2>/dev/null);',
-            'gt2=$(cat "$gtp" 2>/dev/null); if [ -z "$ia2" ] && [ -n "$ia_msr_e1" ]; then ia_msr_e2=$(/data/local/tmp/iotools rdmsr 0 0x639 2>/dev/null); fi; if [ -z "$gt2" ] && [ -n "$gt_msr_e1" ]; then gt_msr_e2=$(/data/local/tmp/iotools rdmsr 0 0x641 2>/dev/null); fi;'
-        );
-        megaCommand = megaCommand.replace(
-            'fi; fi; echo "TPTS_SAMPLE:',
-            'fi; if [ -n "$ia_msr_e1" ] && [ -n "$ia_msr_e2" ] && [ -n "$rapl_unit" ]; then ia_count_1=$((ia_msr_e1 & 0xFFFFFFFF)); ia_count_2=$((ia_msr_e2 & 0xFFFFFFFF)); ia_delta=$((ia_count_2 - ia_count_1)); [ $ia_delta -lt 0 ] && ia_delta=$((ia_delta + 4294967296)); energy_unit=$(( (rapl_unit >> 8) & 0x1F )); ia_mw=$((ia_delta * 1000 / (1 << energy_unit))); fi; if [ -n "$gt_msr_e1" ] && [ -n "$gt_msr_e2" ] && [ -n "$rapl_unit" ]; then gt_count_1=$((gt_msr_e1 & 0xFFFFFFFF)); gt_count_2=$((gt_msr_e2 & 0xFFFFFFFF)); gt_delta=$((gt_count_2 - gt_count_1)); [ $gt_delta -lt 0 ] && gt_delta=$((gt_delta + 4294967296)); energy_unit=$(( (rapl_unit >> 8) & 0x1F )); gt_mw=$((gt_delta * 1000 / (1 << energy_unit))); fi; fi; echo "TPTS_SAMPLE:'
-        );
         megaCommand = megaCommand.replace(/'$/, `${thermalZoneSampleSuffix}'`);
         if (isLocalTarget(target)) {
             sendAdb(['shell', megaCommand]);
@@ -2511,6 +2595,9 @@ function recordTelemetrySample() {
         pkg: latestPackagePower,
         ia: latestIaPower,
         gt: latestGtPower,
+        rest: latestRestPower,
+        limitReasons: latestLimitReasons,
+        rapl: { ...latestRaplSamples },
         tcc: latestTcc,
         prochot: latestProchot,
         fans: detectedFanRpms.slice(),
@@ -2538,9 +2625,11 @@ const pl1PowerHistory = [];
 const pl2PowerHistory = [];
 const iaPowerHistory = [];
 const gtPowerHistory = [];
+const restPowerHistory = [];
 const PKG_POWER_COLOR = '#e8ecf5';
 const IA_POWER_COLOR = '#ec4899';
 const GT_POWER_COLOR = '#3ddc97';
+const REST_POWER_COLOR = '#60a5fa';
 const PL1_POWER_COLOR = '#facc15';
 const PL2_POWER_COLOR = '#fb923c';
 let powerDisplayWidth = 0;
@@ -2572,7 +2661,8 @@ function drawPowerChartGrid() {
         ...(isMetricEnabled('pl1-power') ? pl1PowerHistory : []),
         ...(isMetricEnabled('pl2-power') ? pl2PowerHistory : []),
         ...(isMetricEnabled('ia-power') ? iaPowerHistory : []),
-        ...(isMetricEnabled('gt-power') ? gtPowerHistory : [])
+        ...(isMetricEnabled('gt-power') ? gtPowerHistory : []),
+        ...(isMetricEnabled('rest-power') ? restPowerHistory : [])
     ].filter((value) => value != null);
     const maxPower = Math.max(5, Math.ceil(Math.max(...visibleValues, 0) / 5) * 5);
     powerCtx.clearRect(0, 0, powerDisplayWidth, powerDisplayHeight);
@@ -2613,7 +2703,8 @@ function redrawPowerChart() {
         ...(isMetricEnabled('pl1-power') ? pl1PowerHistory : []),
         ...(isMetricEnabled('pl2-power') ? pl2PowerHistory : []),
         ...(isMetricEnabled('ia-power') ? iaPowerHistory : []),
-        ...(isMetricEnabled('gt-power') ? gtPowerHistory : [])
+        ...(isMetricEnabled('gt-power') ? gtPowerHistory : []),
+        ...(isMetricEnabled('rest-power') ? restPowerHistory : [])
     ].filter((value) => value != null);
     const maxPower = Math.max(5, Math.ceil(Math.max(...visibleValues, 0) / 5) * 5);
     const step = width / (maxDataPoints - 1);
@@ -2639,13 +2730,15 @@ function redrawPowerChart() {
     if (isMetricEnabled('pl2-power')) drawSeries(pl2PowerHistory, PL2_POWER_COLOR, true);
     if (isMetricEnabled('ia-power')) drawSeries(iaPowerHistory, IA_POWER_COLOR, true);
     if (isMetricEnabled('gt-power')) drawSeries(gtPowerHistory, GT_POWER_COLOR, true);
+    if (isMetricEnabled('rest-power')) drawSeries(restPowerHistory, REST_POWER_COLOR, true);
 
     const powerSeries = [
         { key: 'package-power', label: 'Package', color: PKG_POWER_COLOR, values: powerHistory },
         { key: 'pl1-power', label: 'PL1', color: PL1_POWER_COLOR, values: pl1PowerHistory },
         { key: 'pl2-power', label: 'PL2', color: PL2_POWER_COLOR, values: pl2PowerHistory },
         { key: 'ia-power', label: 'IA', color: IA_POWER_COLOR, values: iaPowerHistory },
-        { key: 'gt-power', label: 'GT', color: GT_POWER_COLOR, values: gtPowerHistory }
+        { key: 'gt-power', label: 'GT', color: GT_POWER_COLOR, values: gtPowerHistory },
+        { key: 'rest-power', label: 'Rest', color: REST_POWER_COLOR, values: restPowerHistory }
     ].filter((series) => isMetricEnabled(series.key) && series.values.length > 0);
     const latestSeries = powerSeries.filter((series) => series.values.at(-1) != null);
     latestSeries.forEach((series) => {
@@ -2681,11 +2774,17 @@ function redrawPowerChart() {
 
 function updatePowerChart(powerWatts) {
     latestPackagePower = powerWatts;
-    if (!chartingActive || !['package-power', 'pl1-power', 'pl2-power', 'ia-power', 'gt-power'].some(isMetricEnabled)) return;
-    powerFilterWindow.push(powerWatts);
-    if (powerFilterWindow.length > POWER_FILTER_WINDOW_SIZE) powerFilterWindow.shift();
-    const smoothedPower = powerFilterWindow.reduce((sum, value) => sum + value, 0) / powerFilterWindow.length;
-    powerHistory.push(Math.round(smoothedPower * 100) / 100);
+    renderRestPower(false);
+    if (!chartingActive || !['package-power', 'pl1-power', 'pl2-power', 'ia-power', 'gt-power', 'rest-power'].some(isMetricEnabled)) return;
+    let smoothedPower = null;
+    if (powerWatts === null) {
+        powerFilterWindow.length = 0;
+    } else {
+        powerFilterWindow.push(powerWatts);
+        if (powerFilterWindow.length > POWER_FILTER_WINDOW_SIZE) powerFilterWindow.shift();
+        smoothedPower = Math.round(powerFilterWindow.reduce((sum, value) => sum + value, 0) / powerFilterWindow.length * 100) / 100;
+    }
+    powerHistory.push(smoothedPower);
     if (powerHistory.length > maxDataPoints) powerHistory.shift();
     pl1PowerHistory.push(latestPl1 != null ? Math.round(latestPl1 * 100) / 100 : null);
     if (pl1PowerHistory.length > maxDataPoints) pl1PowerHistory.shift();
@@ -2695,6 +2794,8 @@ function updatePowerChart(powerWatts) {
     if (iaPowerHistory.length > maxDataPoints) iaPowerHistory.shift();
     gtPowerHistory.push(latestGtPower != null ? Math.round(latestGtPower * 100) / 100 : null);
     if (gtPowerHistory.length > maxDataPoints) gtPowerHistory.shift();
+    restPowerHistory.push(latestRestPower);
+    if (restPowerHistory.length > maxDataPoints) restPowerHistory.shift();
     redrawPowerChart();
 }
 
@@ -2746,6 +2847,7 @@ socket.onmessage = (event) => {
 
         if (processThermalJsonBackendOutput(rawLog)) return;
         if (processGeekbenchOutput(rawLog)) return;
+        parseMsrUnits(rawLog);
 
         if (rawLog.includes("TPTS_TUNING_SYNC_BEGIN")) {
             tuningSyncInProgress = true;
@@ -2775,7 +2877,7 @@ socket.onmessage = (event) => {
             if (!sync610 && syncTokens.length >= 1) sync610 = normalizeHex(syncTokens[0]);
             if (!sync601 && syncTokens.length >= 2) sync601 = normalizeHex(syncTokens[1]);
 
-            if (sync610 && sync601 && default610 && default601) {
+            if (sync610 && sync601 && default610 && default601 && msrPowerUnitWatts) {
                 if (sync610) {
                     try { decodeAndRenderPLFrom610(sync610); } catch (e) {}
                 }
@@ -2787,9 +2889,9 @@ socket.onmessage = (event) => {
                     const default601Value = BigInt(default601);
                     tuningDefaultRegisters.msr610 = default610;
                     tuningDefaultRegisters.msr601 = default601;
-                    tuningDefaults.pl1 = Number(default610Value & 0x7FFFn) * 0.125;
-                    tuningDefaults.pl2 = Number((default610Value >> 32n) & 0x7FFFn) * 0.125;
-                    tuningDefaults.pl4 = Number(default601Value & 0x1FFFn) * 0.125;
+                    tuningDefaults.pl1 = Number(default610Value & 0x7FFFn) * msrPowerUnitWatts;
+                    tuningDefaults.pl2 = Number((default610Value >> 32n) & 0x7FFFn) * msrPowerUnitWatts;
+                    tuningDefaults.pl4 = Number(default601Value & 0x1FFFn) * msrPowerUnitWatts;
                     setTuningFieldDefault('tune-pl1', tuningDefaults.pl1);
                     setTuningFieldDefault('tune-pl2', tuningDefaults.pl2);
                     setTuningFieldDefault('tune-pl4', tuningDefaults.pl4);
@@ -2853,7 +2955,20 @@ socket.onmessage = (event) => {
             }
         }
         
-        if (telemetryDebugEnabled && (rawLog.includes('RAPL_NAMED:') || rawLog.includes('RAPL_RAW:'))) {
+        for (const raplMatch of rawLog.matchAll(/RAPL_SAMPLE: DOMAIN=(package|ia|gt) SOURCE=(\S+) E1=(\d+|NA) E2=(\d+|NA) T1_MS=(\d+|NA) T2_MS=(\d+) RANGE=(\d+) UNIT=(\S+) STATUS=(\S+)/g)) {
+            const [, domain, source, before, after, start, end, range, unit, status] = raplMatch;
+            if (domain === 'package') latestRaplSamples = {};
+            latestRaplSamples[domain] = {
+                source, energy_before: before, energy_after: after,
+                time_before_ms: start, time_after_ms: end, range, unit, status
+            };
+            awaitingRaplSampleEnd = true;
+        }
+        if (rawLog.includes('TPTS_RAPL_UPDATE_REQUIRED')) {
+            latestRaplSamples = {};
+            appendConsole('[RAPL] Device script is outdated. Reconnect the device to deploy the updated sampler.');
+        }
+        if (telemetryDebugEnabled && (rawLog.includes('RAPL_NAMED:') || rawLog.includes('RAPL_RAW:') || rawLog.includes('RAPL_SAMPLE:'))) {
             appendConsole(`[RAPL Debug] ${rawLog.trim()}`);
         }
         const namedRaplMatch = rawLog.match(/RAPL_NAMED:\s+PKG_MW=(\d+|NA)\s+IA_MW=(\d+|NA)\s+GT_MW=(\d+|NA)\s+PKG_PATH=(\S+)\s+IA_PATH=(\S+)\s+GT_PATH=(\S+)/i);
@@ -2909,15 +3024,20 @@ socket.onmessage = (event) => {
         }
 
         // 📊【功率解析】：優先讀毫瓦標籤 (低功耗仍有解析度)，退回整數瓦相容壓測腳本
+        let discoveredPower;
         if (!namedRaplActive && rawLog.includes("PKG_POWER_MW:")) {
-            const mwMatch = rawLog.match(/PKG_POWER_MW:\s*(\d+)/i);
+            const mwMatch = rawLog.match(/PKG_POWER_MW:\s*(\d+|NA)\b/i);
             if (mwMatch) {
-                const powerWatts = parseInt(mwMatch[1], 10) / 1000;
+                const powerWatts = mwMatch[1].toUpperCase() === 'NA' ? null : parseInt(mwMatch[1], 10) / 1000;
                 const powerEl = document.getElementById('v-power');
                 if (powerEl) {
-                    powerEl.innerText = `${powerWatts.toFixed(2)} W`;
+                    powerEl.innerText = powerWatts === null ? '-- W' : `${powerWatts.toFixed(2)} W`;
                 }
-                updatePowerChart(powerWatts);
+                if (powerWatts === null) {
+                    latestPackagePower = null;
+                    powerFilterWindow.length = 0;
+                }
+                discoveredPower = powerWatts;
             }
         } else if (rawLog.includes("PKG_POWER_WATTS:")) {
             const powerMatch = rawLog.match(/PKG_POWER_WATTS:\s*(\d+)/i);
@@ -2927,7 +3047,7 @@ socket.onmessage = (event) => {
                 if (powerEl) {
                     powerEl.innerText = `${powerWatts} W`;
                 }
-                updatePowerChart(powerWatts);
+                discoveredPower = powerWatts;
             }
         }
 
@@ -2942,6 +3062,7 @@ socket.onmessage = (event) => {
             latestIaPower = iaMatch[1] === 'NA' ? null : parseInt(iaMatch[1], 10) / 1000;
             const iaEl = document.getElementById('v-ia-power');
             if (iaEl) iaEl.innerText = latestIaPower === null ? '-- W' : `${latestIaPower.toFixed(2)} W`;
+            renderRestPower(isPipelineRunning);
             if (isPipelineRunning && iaPowerHistory.length) {
                 iaPowerHistory[iaPowerHistory.length - 1] = latestIaPower;
                 redrawPowerChart();
@@ -2952,11 +3073,13 @@ socket.onmessage = (event) => {
             latestGtPower = gtMatch[1] === 'NA' ? null : parseInt(gtMatch[1], 10) / 1000;
             const gtEl = document.getElementById('v-gt-power');
             if (gtEl) gtEl.innerText = latestGtPower === null ? '-- W' : `${latestGtPower.toFixed(2)} W`;
+            renderRestPower(isPipelineRunning);
             if (isPipelineRunning && gtPowerHistory.length) {
                 gtPowerHistory[gtPowerHistory.length - 1] = latestGtPower;
                 redrawPowerChart();
             }
         }
+        if (discoveredPower !== undefined) updatePowerChart(discoveredPower);
         const rawFanCountMatch = rawLog.match(/Number of fans\s*=\s*(\d+)/i);
         if (rawFanCountMatch) {
             detectedFanCount = parseInt(rawFanCountMatch[1], 10);
@@ -3042,11 +3165,10 @@ socket.onmessage = (event) => {
             }
         }
 
-        // 狀態燈號控制 (0x19C)
-        const tagged19c = rawLog.match(/MSR_19C:\s*(0x[0-9a-fA-F]+|[0-9a-fA-F]+)/i);
-        if ((tagged19c && tagged19c[1]) || (rawLog.includes("19C") && hexTokens && hexTokens.length >= 1)) {
-            const thermToken = tagged19c && tagged19c[1] ? normalizeHex(tagged19c[1]) : hexTokens[hexTokens.length - 1];
-            const thermReg = parseInt(thermToken, 16);
+        // Package-level thermal status (IA32_PACKAGE_THERM_STATUS, same as PTAT MSR_PACKAGE_TEMP).
+        const tagged1b1 = rawLog.match(/MSR_1B1:\s*(0x[0-9a-fA-F]+)/i);
+        if (tagged1b1) {
+            const thermReg = parseInt(tagged1b1[1], 16);
             if (!isNaN(thermReg) && thermReg > 0x100000) {
                 const lampT = document.getElementById('lamp-thermal');
                 const lampP = document.getElementById('lamp-prochot');
@@ -3058,12 +3180,11 @@ socket.onmessage = (event) => {
                 latestProchot = (thermReg & 4) ? 1 : 0;
                 latestPowerLimit = (thermReg & 1024) ? 1 : 0;
                 
-                // 兜底防護：若壓測腳本剛好沒印出 SOC_TEMP_CELSIUS，用 MSR 暫存器算出來防空包彈
-                // 壓測期間溫度以 SOC_TEMP_CELSIUS 為準，避免 0x19C 額外推點造成溫度比功耗快
-                if (discoveredTemp === null && !isPipelineRunning) {
+                // 壓測期間溫度以 SOC_TEMP_CELSIUS 為準，避免 MSR 額外推點造成溫度比功耗快
+                if (discoveredTemp === null && !isPipelineRunning && msrTjMaxC) {
                     const digitalReadout = (thermReg >> 16) & 0x7F;
-                    if (digitalReadout > 0 && digitalReadout < 100) {
-                        discoveredTemp = 100 - digitalReadout;
+                    if (digitalReadout > 0 && digitalReadout < msrTjMaxC) {
+                        discoveredTemp = msrTjMaxC - digitalReadout;
                     }
                 }
             }
@@ -3090,25 +3211,33 @@ socket.onmessage = (event) => {
             updateMonitorEvents();
         }
         if (rawLog.includes('TPTS_SAMPLE_END')) {
+            telemetrySampleStartedAt = 0;
             if (awaitingStructuredSampleEnd && pendingStructuredTemperature !== null) {
                 scheduleChartUpdate(pendingStructuredTemperature);
             }
             pendingStructuredTemperature = null;
             awaitingStructuredSampleEnd = false;
         }
-        const stressSampleComplete = /^PKG_POWER_MW:\s*\d+/i.test(rawLog.trim());
+        const tagged64f = rawLog.match(/MSR_64F:\s*(0x[0-9a-fA-F]+|[0-9a-fA-F]+)/i);
+        const raw64f = tagged64f ? normalizeHex(tagged64f[1]) : rawLog.includes('TELEMETRY_DATA:') && hexTokens && hexTokens.length >= 3 ? hexTokens[1] : null;
+        if (raw64f) {
+            const decodedReasons = decodeCoreLimitReasons(raw64f);
+            if (decodedReasons) {
+                latestLimitReasons = decodedReasons;
+                updateMonitorEvents();
+            }
+        }
+        const raplSampleComplete = rawLog.includes('TPTS_SAMPLE_END') || rawLog.includes('TPTS_POWER_SAMPLE_END');
+        const stressSampleComplete = rawLog.includes('TPTS_POWER_SAMPLE_END') || (!awaitingRaplSampleEnd && /^PKG_POWER_MW:\s*\d+/i.test(rawLog.trim()));
         if (isPipelineRunning && stressSampleComplete) evaluateThermalTuneGuard();
-        if (chartingActive && Date.now() >= telemetryHistoryReadyAt && (discoveredTemp !== null || rawLog.includes('TPTS_SAMPLE:'))) {
+        if (chartingActive && Date.now() >= telemetryHistoryReadyAt && ((awaitingRaplSampleEnd && raplSampleComplete) || (!awaitingRaplSampleEnd && (discoveredTemp !== null || rawLog.includes('TPTS_SAMPLE:'))))) {
             recordTelemetrySample();
         }
+        if (raplSampleComplete) awaitingRaplSampleEnd = false;
 
         // 剩餘普通 MSR 欄位轉填
         const v64f = document.getElementById('v64f'); const v6b0 = document.getElementById('v6b0');
-        const tagged64f = rawLog.match(/MSR_64F:\s*(0x[0-9a-fA-F]+|[0-9a-fA-F]+)/i);
-        if (tagged64f && tagged64f[1] && v64f) {
-            const normalized64f = normalizeHex(tagged64f[1]);
-            if (normalized64f) v64f.innerText = normalized64f;
-        }
+        if (raw64f && v64f) v64f.innerText = raw64f;
         const tagged6b0 = rawLog.match(/MSR_6B0:\s*(0x[0-9a-fA-F]+|[0-9a-fA-F]+)/i);
         if (tagged6b0 && tagged6b0[1] && v6b0) {
             const normalized6b0 = normalizeHex(tagged6b0[1]);
