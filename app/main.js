@@ -4,6 +4,11 @@
 const wsHost = window.location.host || '127.0.0.1:8080';
 const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
 const socket = new WebSocket(`${wsProtocol}://${wsHost}/ws`);
+// Must match tptsVersion in proxy/main.go.
+const TPTS_APP_VERSION = '2026.10.27-2';
+let backendVersionChecked = false;
+// Per-second sampler output; kept out of the System Log during stress tests.
+const TELEMETRY_STREAM_LINE = /^(TPTS_SAMPLE|TPTS_THERMAL_ZONE|RAPL_SAMPLE|CPU_LIMIT_SAMPLE)/;
 const isAndroidRuntime = /Android/i.test(navigator.userAgent || '');
 const isFileMode = window.location.protocol === 'file:';
 const shouldAutoLocalMode = isAndroidRuntime || isFileMode;
@@ -48,6 +53,7 @@ let latestIaPower = null;
 let latestGtPower = null;
 let latestRestPower = null;
 let latestLimitReasons = null;
+let cpuLimitSampleSeen = false;
 let msrPowerUnitWatts = null;
 let msrTjMaxC = null;
 let latestCpuFreqGhz = null;
@@ -62,14 +68,14 @@ let telemetryExportSelection = null;
 // uncore energy counter updates slower than the 1s in-sample window, so GT is derived across samples
 let lastUncoreEnergyUj = null;
 let lastUncoreSampleMs = 0;
-let telemetrySampler = null;
 // Cards sample continuously after connect; curves only draw when charting is on (Start Monitoring button).
 let chartingActive = false;
+// Set by Start Monitoring; charting turns on at the next sample start so temperature and power stay aligned.
+let chartingStartPending = false;
 let telemetryHistoryReadyAt = 0;
 let telemetryDebugEnabled = false;
 let latestRaplSamples = {};
 let awaitingRaplSampleEnd = false;
-let telemetrySampleStartedAt = 0;
 let pendingChartTemperature = null;
 let pendingChartTimer = null;
 let pendingStructuredTemperature = null;
@@ -106,6 +112,8 @@ const powerFilterWindow = [];
 const POWER_FILTER_WINDOW_SIZE = 4;
 const SAMPLE_INTERVAL_SECONDS = 1;
 const HISTORY_SECONDS = 60;
+// Browser export keeps the last hour; the complete record is the device-side monitor log.
+const MAX_TELEMETRY_LOG_ROWS = 3600;
 
 function normalizeTarget(value) {
     const raw = (value || '').trim();
@@ -208,6 +216,8 @@ function captureTelemetryExportSelection() {
     if (isMetricEnabled('gt-power')) selectedMetrics.push({ header: 'gt_power_w', value: (row) => row.gt });
     if (isMetricEnabled('rest-power')) selectedMetrics.push({ header: 'rest_of_package_power_w', value: (row) => row.rest });
     selectedMetrics.push({ header: 'cpu_limit_reasons', value: (row) => row.limitReasons?.active.join(';') });
+    selectedMetrics.push({ header: 'cpu_limit_reasons_last_1s', value: (row) => row.limitReasons?.seen?.join(';') });
+    selectedMetrics.push({ header: 'cpu_limit_cores', value: (row) => Object.entries(row.limitReasons?.cores || {}).map(([reason, cpus]) => `${reason}:${cpus.join('/')}`).join(';') });
     selectedMetrics.push({ header: 'cpu_limit_reasons_logged', value: (row) => row.limitReasons?.logged.join(';') });
     thermalZoneMetricKeys.forEach((zone) => {
         if (isMetricEnabled(zone.metricKey)) {
@@ -362,6 +372,7 @@ const CORE_LIMIT_REASON_BITS = [
     [8, 'OTHER'], [10, 'PBM_PL1'], [11, 'PBM_PL2'], [12, 'MAX_TURBO_LIMIT'], [13, 'TURBO_ATTEN']
 ];
 const THERMAL_LIMIT_REASONS = new Set(['PROCHOT', 'THERMAL', 'RATL', 'VR_THERMALERT']);
+const INFO_LIMIT_REASONS = new Set(['MAX_TURBO_LIMIT', 'TURBO_ATTEN']);
 
 function decodeCoreLimitReasons(hexValue) {
     if (!/^0x[0-9a-f]+$/i.test(hexValue || '')) return null;
@@ -371,6 +382,29 @@ function decodeCoreLimitReasons(hexValue) {
         active: CORE_LIMIT_REASON_BITS.filter(([bit]) => (value >>> bit) & 1).map(([, name]) => name),
         logged: CORE_LIMIT_REASON_BITS.filter(([bit]) => (value >>> (bit + 16)) & 1).map(([, name]) => name)
     };
+}
+
+// NOW/SEEN/CORES are decimal; SEEN is every reason active during the device's ~100 ms polls since the previous sample.
+function decodeCpuLimitSample(text) {
+    const match = (text || '').match(/CPU_LIMIT_SAMPLE: NOW=(\d+) SEEN=(\d+) CORES=(\S*)/);
+    if (!match) return null;
+    const toHex = (value) => `0x${Number(value).toString(16).padStart(8, '0')}`;
+    const sample = decodeCoreLimitReasons(toHex(match[1]));
+    sample.seen = decodeCoreLimitReasons(toHex(match[2])).active;
+    const cores = {};
+    const values = new Set();
+    for (const entry of match[3].split(',')) {
+        const [cpu, value] = entry.split(':');
+        if (!/^\d+$/.test(cpu || '') || !/^\d+$/.test(value || '')) continue;
+        values.add(value);
+        for (const reason of decodeCoreLimitReasons(toHex(value)).active) {
+            if (!cores[reason]) cores[reason] = [];
+            cores[reason].push(`CPU${cpu}`);
+        }
+    }
+    // Some platforms report one package-wide value on every core; listing cores then adds noise.
+    sample.cores = values.size > 1 ? cores : null;
+    return sample;
 }
 
 function renderRestPower(patchHistory) {
@@ -402,12 +436,26 @@ function updateMonitorEvents() {
     updateMonitorEvent('prochot', latestProchot ? 'ACTIVE' : 'OK', latestProchot ? 'active' : '');
     updateMonitorEvent('power', latestPowerLimit ? 'ACTIVE' : 'OK', latestPowerLimit ? 'active' : '');
     const limitReasons = latestLimitReasons?.active || [];
-    updateMonitorEvent('clip', !latestLimitReasons ? '--' : limitReasons.length ? limitReasons.join(', ') : 'OK',
-        limitReasons.some((reason) => THERMAL_LIMIT_REASONS.has(reason)) ? 'active' : limitReasons.length ? 'warn' : '');
+    const shownReasons = latestLimitReasons?.seen || limitReasons;
+    const infoOnly = shownReasons.length > 0 && shownReasons.every((reason) => INFO_LIMIT_REASONS.has(reason));
+    updateMonitorEvent('clip', !latestLimitReasons ? '--' : !shownReasons.length ? 'OK' : infoOnly ? 'OK (at max turbo)' : shownReasons.join(', '),
+        shownReasons.some((reason) => THERMAL_LIMIT_REASONS.has(reason)) ? 'active' : shownReasons.length && !infoOnly ? 'warn' : '');
     const clipRow = document.querySelector('[data-event-row="clip"]');
-    if (clipRow && latestLimitReasons) {
-        clipRow.title = `MSR 0x64F ${latestLimitReasons.raw}\nActive: ${limitReasons.join(', ') || 'Not Clipped'}\nLogged since last clear: ${latestLimitReasons.logged.join(', ') || 'None'}`;
+    const clipDetail = document.getElementById('clip-detail');
+    if (latestLimitReasons) {
+        const cores = latestLimitReasons.cores;
+        const withCores = (reason) => cores?.[reason] ? `${reason} (${cores[reason].join(', ')})` : reason;
+        const lines = [`Now: ${limitReasons.map(withCores).join(', ') || 'Not limited'}`];
+        if (latestLimitReasons.seen) lines.push(`Last 1s: ${latestLimitReasons.seen.join(', ') || 'None'}`);
+        lines.push(`History (since boot, not current): ${latestLimitReasons.logged.join(', ') || 'None'}`);
+        lines.push(`MSR 0x64F${latestLimitReasons.seen ? ' (all cores)' : ''} ${latestLimitReasons.raw}`);
+        const detail = lines.join('\n');
+        if (clipRow) clipRow.title = detail;
+        if (clipDetail) clipDetail.textContent = detail;
     }
+    if (clipDetail) clipDetail.hidden = !latestLimitReasons;
+    const clipHelp = document.getElementById('clip-help');
+    if (clipHelp) clipHelp.hidden = !latestLimitReasons;
     updateMonitorEvent('temperature', temp >= 92 ? 'CRITICAL' : temp >= 85 ? 'HIGH' : 'OK', temp >= 92 ? 'active' : temp >= 85 ? 'warn' : '');
     updateMonitorEvent('fan', fanStalled ? 'CHECK FAN' : detectedFanCount > 0 ? 'OK' : 'NOT DETECTED', fanStalled ? 'active' : detectedFanCount > 0 ? '' : 'warn');
     const telemetryAge = latestTelemetryAt ? Date.now() - latestTelemetryAt : Number.POSITIVE_INFINITY;
@@ -457,6 +505,21 @@ function powerLimitStep() {
     return msrPowerUnitWatts ?? 0.125;
 }
 
+// Last PL values written by Apply Power Limits / Auto Tune; null means the device should be at its saved default.
+let appliedPowerLimits = null;
+
+function renderPowerLimitHint(id, key, watts) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const reference = appliedPowerLimits?.[key] ?? tuningDefaults[key];
+    const limited = Number.isFinite(reference) && watts < reference - 0.01;
+    el.innerText = `Now: ${formatPowerWatts(watts)} W${limited ? ' (limited)' : ''}`;
+    el.classList.toggle('limited-hint', limited);
+    el.title = limited
+        ? `The device is using ${formatPowerWatts(watts)} W, below the ${formatPowerWatts(reference)} W that TPTS applied or saved as the system default. Another controller lowered it, usually the Android thermal HAL power-cap cooling device. See TPTS.md, "Power limit setting vs Now".`
+        : 'Value the device is using now (MSR 0x610 / 0x601).';
+}
+
 function decodeAndRenderPLFrom610(hex610) {
     if (!hex610 || !hex610.startsWith('0x')) return;
     currentPowerLimitRegister = hex610;
@@ -470,13 +533,11 @@ function decodeAndRenderPLFrom610(hex610) {
     let pl1_watts = pl1_raw * msrPowerUnitWatts;
     let pl2_watts = pl2_raw * msrPowerUnitWatts;
 
-    const pl1El = document.getElementById('v-pl1');
-    const pl2El = document.getElementById('v-pl2');
     const v610 = document.getElementById('v610');
     const pl1Text = formatPowerWatts(pl1_watts);
     const pl2Text = formatPowerWatts(pl2_watts);
-    if (pl1El) pl1El.innerText = `${pl1Text} W`;
-    if (pl2El) pl2El.innerText = `${pl2Text} W`;
+    renderPowerLimitHint('v-pl1', 'pl1', pl1_watts);
+    renderPowerLimitHint('v-pl2', 'pl2', pl2_watts);
     latestPl1 = pl1_watts;
     latestPl2 = pl2_watts;
     const pl1Card = document.getElementById('v-pl1-live');
@@ -494,9 +555,7 @@ function decodeAndRenderPL4From601(hex601) {
     let pl4_raw = parseInt(hex601, 16) & 0x1FFF;     // bit 0:12
     let pl4_watts = pl4_raw * msrPowerUnitWatts;
 
-    const pl4El = document.getElementById('v-pl4');
-    const pl4Text = formatPowerWatts(pl4_watts);
-    if (pl4El) pl4El.innerText = `${pl4Text} W`;
+    renderPowerLimitHint('v-pl4', 'pl4', pl4_watts);
 }
 
 function sendAdb(args) {
@@ -815,6 +874,7 @@ function resetTuningDefaultSyncState() {
     tuningDefaults.pl4 = null;
     tuningDefaultRegisters.msr610 = null;
     tuningDefaultRegisters.msr601 = null;
+    appliedPowerLimits = null;
     ['tune-pl1', 'tune-pl2', 'tune-pl4'].forEach((id) => {
         const el = document.getElementById(id);
         if (el) delete el.dataset.userEdited;
@@ -953,12 +1013,10 @@ function resetLiveDeviceState() {
     isDeviceConnected = false;
     deviceProductName = '';
     devicePlatformName = '';
-    if (monitorTimer !== null) {
-        clearInterval(monitorTimer);
-        monitorTimer = null;
-    }
-    telemetrySampler = null;
+    if (chartingActive && connectedDeviceTarget) sendAdb(['MONITOR_LOG_STOP', connectedDeviceTarget]);
+    stopLiveTelemetryLoop();
     chartingActive = false;
+    chartingStartPending = false;
     stopMonitoringElapsedCounter();
     if (pendingChartTimer !== null) {
         clearTimeout(pendingChartTimer);
@@ -1004,6 +1062,7 @@ function resetLiveDeviceState() {
     latestGtPower = null;
     latestRestPower = null;
     latestLimitReasons = null;
+    cpuLimitSampleSeen = false;
     latestSocTemp = null;
     latestCpuFreqGhz = null;
     latestTcc = 0;
@@ -1116,14 +1175,12 @@ function applyPowerLimits() {
         consoleBox.scrollTop = consoleBox.scrollHeight;
     }
 
-    const pl1El = document.getElementById('v-pl1');
-    const pl2El = document.getElementById('v-pl2');
-    const pl4El = document.getElementById('v-pl4');
     latestPl1 = pl1;
     latestPl2 = pl2;
-    if (pl1El) pl1El.innerText = `${formatPowerWatts(pl1)} W`;
-    if (pl2El) pl2El.innerText = `${formatPowerWatts(pl2)} W`;
-    if (pl4El) pl4El.innerText = `${formatPowerWatts(pl4)} W`;
+    appliedPowerLimits = { pl1, pl2, pl4 };
+    renderPowerLimitHint('v-pl1', 'pl1', pl1);
+    renderPowerLimitHint('v-pl2', 'pl2', pl2);
+    renderPowerLimitHint('v-pl4', 'pl4', pl4);
     const pl1LiveEl = document.getElementById('v-pl1-live');
     const pl2LiveEl = document.getElementById('v-pl2-live');
     if (pl1LiveEl) pl1LiveEl.innerText = `${formatPowerWatts(pl1)} W`;
@@ -1147,6 +1204,7 @@ function resetPowerLimitsToSystemDefault() {
     }
     currentPowerLimitRegister = msr610;
     currentPowerLimit4Register = msr601;
+    appliedPowerLimits = null;
     // "Reset" must overwrite the editable inputs even if the user had previously typed custom values.
     ['tune-pl1', 'tune-pl2', 'tune-pl4'].forEach((id) => {
         const el = document.getElementById(id);
@@ -1353,16 +1411,19 @@ function restoreAllUiToIdle(resumeMonitoring = true) {
 
     const monitorBtn = document.querySelector('.btn-secondary');
     if (monitorBtn) {
+        const keepMonitoring = resumeMonitoring && wasMonitoringBeforePipeline;
         wasMonitoringBeforePipeline = false;
-        if (resumeMonitoring) {
+        if (keepMonitoring) {
             chartingActive = true;
-            startLiveTelemetryLoop(true);
             renderMonitorButton(true);
+            appendConsole('[Stress] Finished. Monitoring continues (it was on before the test).');
         } else {
             chartingActive = false;
             stopMonitoringElapsedCounter();
             renderMonitorButton(false);
+            if (resumeMonitoring) appendConsole('[Stress] Finished. Charting stopped; Live Data cards keep updating.');
         }
+        if (resumeMonitoring && isDeviceConnected && monitorTimer === null) startLiveTelemetryLoop();
     }
     toggleFanInput();
     toggleStressWorkloadOptions();
@@ -1701,17 +1762,9 @@ function startThermalPipeline() {
         return alert('Wait until the Geekbench package is ready before starting the test.');
     }
 
-    if (monitorTimer !== null) {
-        wasMonitoringBeforePipeline = true;
-        clearInterval(monitorTimer);
-        monitorTimer = null; 
-    } else {
-        wasMonitoringBeforePipeline = false;
-    }
-    telemetrySampler = null;
-    namedRaplActive = false;
-    latestRaplSamples = {};
-    awaitingRaplSampleEnd = false;
+    // The live sampler keeps running through the test; charts continue only if monitoring was on.
+    wasMonitoringBeforePipeline = chartingActive || chartingStartPending;
+    chartingStartPending = false;
     latestIaPower = null;
     latestGtPower = null;
     latestRestPower = null;
@@ -2227,13 +2280,11 @@ function startLiveTelemetry() {
     const monitorBtn = document.querySelector('.btn-secondary'); 
     if (!monitorBtn) return;
 
-    if (chartingActive) {
+    if (chartingActive || chartingStartPending) {
+        // Stop only charting and the device log; the cards keep updating from the live sampler.
         chartingActive = false;
-        if (monitorTimer !== null) {
-            clearInterval(monitorTimer);
-            monitorTimer = null;
-        }
-        telemetrySampler = null;
+        chartingStartPending = false;
+        sendAdb(['MONITOR_LOG_STOP', normalizeTarget(document.getElementById('ip')?.value || '')]);
         stopMonitoringElapsedCounter();
         renderMonitorButton(false);
         consoleBox.innerHTML += `[Monitor] ⏹ Monitoring stopped.\n`;
@@ -2241,7 +2292,14 @@ function startLiveTelemetry() {
         consoleBox.scrollTop = consoleBox.scrollHeight;
     } else {
         // Start drawing curves from a clean slate.
-        chartingActive = true;
+        chartingStartPending = true;
+        if (pendingChartTimer !== null) {
+            clearTimeout(pendingChartTimer);
+            pendingChartTimer = null;
+        }
+        pendingChartTemperature = null;
+        pendingStructuredTemperature = null;
+        awaitingStructuredSampleEnd = false;
         clearTemperatureHistories();
         powerHistory.length = 0;
         pl1PowerHistory.length = 0;
@@ -2256,6 +2314,7 @@ function startLiveTelemetry() {
         drawPowerChartGrid();
         startMonitoringElapsedCounter();
         if (monitorTimer === null) startLiveTelemetryLoop();
+        sendAdb(['MONITOR_LOG_START', normalizeTarget(document.getElementById('ip')?.value || '')]);
         renderMonitorButton(true);
         consoleBox.innerHTML += `\n[Monitor] ▶️ Starting live chart rendering...\n`;
         trimConsoleLog(consoleBox);
@@ -2263,15 +2322,19 @@ function startLiveTelemetry() {
     }
 }
 
+function stopLiveTelemetryLoop() {
+    if (monitorTimer === null) return;
+    monitorTimer = null;
+    sendAdb(['STOP_LIVE_MONITOR']);
+}
+
+// Streams from the device-resident 1 s sampler (the only telemetry source).
 function startLiveTelemetryLoop(resetHistory = false) {
-    if (monitorTimer) {
-        clearInterval(monitorTimer);
-    }
+    // The backend replaces any running sampler, so no separate stop is sent here.
     monitorTimer = null; 
     namedRaplActive = false;
     latestRaplSamples = {};
     awaitingRaplSampleEnd = false;
-    telemetrySampleStartedAt = 0;
     
     if (resetHistory) {
         clearTemperatureHistories();
@@ -2287,9 +2350,6 @@ function startLiveTelemetryLoop(resetHistory = false) {
     }
     lastUncoreEnergyUj = null;
     lastUncoreSampleMs = 0;
-    // A prior one-shot ADB command can finish after a new session begins.
-    // Temperature/frequency are available from the first read. RAPL power still
-    // needs its one-second delta window, but that must not delay the temperature chart.
     telemetryHistoryReadyAt = Date.now();
     drawChartGrid(); 
     drawPowerChartGrid();
@@ -2305,63 +2365,8 @@ function startLiveTelemetryLoop(resetHistory = false) {
         sendAdb(['-s', target, 'shell', fanCommand]);
     }
 
-    // 🎯【正確鎖定】：100% 走 Linux 核心 sysfs 指令，同時加入 MSR 暫存器轟炸
-    telemetrySampler = () => {
-        const target = normalizeTarget(document.getElementById('ip') ? document.getElementById('ip').value : '');
-        if (!target) return;
-        if (telemetrySampleStartedAt && Date.now() - telemetrySampleStartedAt < 10000) return;
-        telemetrySampleStartedAt = Date.now();
-        let megaCommand = `su 0 sh -c '
-temp_value=
-for z in /sys/class/thermal/thermal_zone*; do
-    t=$(cat "$z/type" 2>/dev/null)
-    if [ "$t" = "x86_pkg_temp" ]; then temp_value=$(cat "$z/temp" 2>/dev/null); break; fi
-done
-if [ -z "$temp_value" ] && [ -f /sys/class/thermal/thermal_zone0/temp ]; then temp_value=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null); fi
-freq_value=
-f=/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq
-[ -f "$f" ] && freq_value=$(cat "$f" 2>/dev/null)
-fan_count=$(ectool pwmgetnumfans 2>/dev/null | sed -n "s/.*= *//p")
-fan_values=
-if [ -n "$fan_count" ]; then
-    fan_values=$(ectool pwmgetfanrpm 2>/dev/null | sed -n "s/.*RPM: *//p" | tr "\\n" ",")
-else
-    fan_count=0
-    for fan in /sys/class/hwmon/hwmon*/fan*_input; do
-        [ -f "$fan" ] || continue
-        rpm=$(cat "$fan" 2>/dev/null)
-        if [ -n "$rpm" ]; then fan_values="\${fan_values:+$fan_values,}$rpm"; fan_count=$((fan_count + 1)); fi
-    done
-fi
-PKG_POWER_MW=NA IA_POWER_MW=NA GT_POWER_MW=NA
-if grep -q "^rapl_collect()" /data/local/tmp/run_stressapp.sh 2>/dev/null; then
-    set -- --rapl-sample
-    . /data/local/tmp/run_stressapp.sh
-else
-    echo TPTS_RAPL_UPDATE_REQUIRED
-fi
-echo "TPTS_SAMPLE: TARGET_SYSFS_TEMP: \${temp_value:-NA} CPU_FREQ_KHZ: \${freq_value:-NA} FAN_COUNT: \${fan_count:-0} FAN_RPMS: \${fan_values:-NA} PKG_POWER_MW: $PKG_POWER_MW IA_MW: $IA_POWER_MW GT_MW: $GT_POWER_MW MSR_606: $(/data/local/tmp/iotools rdmsr 0 0x606 2>/dev/null) MSR_1A2: $(/data/local/tmp/iotools rdmsr 0 0x1A2 2>/dev/null) MSR_1B1: $(/data/local/tmp/iotools rdmsr 0 0x1B1 2>/dev/null) MSR_610: $(/data/local/tmp/iotools rdmsr 0 0x610 2>/dev/null) MSR_601: $(/data/local/tmp/iotools rdmsr 0 0x601 2>/dev/null) MSR_64F: $(/data/local/tmp/iotools rdmsr 0 0x64F 2>/dev/null) MSR_6B0: $(/data/local/tmp/iotools rdmsr 0 0x6B0 2>/dev/null)"'`;
-        const thermalZoneSampleSuffix = '; for z in /sys/class/thermal/thermal_zone*; do [ -d "$z" ] || continue; index=${z##*thermal_zone}; type=$(cat "$z/type" 2>/dev/null | tr "[:space:]" "_"); temp=$(cat "$z/temp" 2>/dev/null); [ -n "$type" ] && [ -n "$temp" ] && echo TPTS_THERMAL_ZONE: $index:$type:$temp; done; echo TPTS_SAMPLE_END';
-        megaCommand = megaCommand.replace(/'$/, `${thermalZoneSampleSuffix}'`);
-        if (isLocalTarget(target)) {
-            sendAdb(['shell', megaCommand]);
-        } else {
-            sendAdb(['-s', target, 'shell', megaCommand]);
-        }
-    };
-    monitorTimer = setInterval(telemetrySampler, SAMPLE_INTERVAL_SECONDS * 1000);
-    telemetrySampler();
-}
-
-// One-shot telemetry sample so cards populate right after ADB connect (no continuous loop).
-function sampleTelemetryOnce() {
-    if (!isDeviceConnected) return;
-    const wasMonitoring = monitorTimer !== null;
-    startLiveTelemetryLoop();
-    if (!wasMonitoring && monitorTimer) {
-        clearInterval(monitorTimer);
-        monitorTimer = null;
-    }
+    monitorTimer = 'device-stream';
+    sendAdb(['START_LIVE_MONITOR', target]);
 }
 
 // =========================================================
@@ -2603,6 +2608,7 @@ function recordTelemetrySample() {
         fans: detectedFanRpms.slice(),
         thermalZones: Object.fromEntries([...thermalZoneMetricKeys.values()].map((zone) => [zone.metricKey, zone.latestTemperature]))
     });
+    if (telemetryLog.length > MAX_TELEMETRY_LOG_ROWS) telemetryLog.shift();
 }
 
 function updateThermalZoneChart(metricKey, temperature) {
@@ -2895,12 +2901,6 @@ socket.onmessage = (event) => {
                     setTuningFieldDefault('tune-pl1', tuningDefaults.pl1);
                     setTuningFieldDefault('tune-pl2', tuningDefaults.pl2);
                     setTuningFieldDefault('tune-pl4', tuningDefaults.pl4);
-                    const pl1El = document.getElementById('v-pl1');
-                    const pl2El = document.getElementById('v-pl2');
-                    const pl4El = document.getElementById('v-pl4');
-                    if (pl1El) pl1El.innerText = `${formatPowerWatts(tuningDefaults.pl1)} W`;
-                    if (pl2El) pl2El.innerText = `${formatPowerWatts(tuningDefaults.pl2)} W`;
-                    if (pl4El) pl4El.innerText = `${formatPowerWatts(tuningDefaults.pl4)} W`;
                     appendConsole(`[Tuning] System defaults saved: PL1=${formatPowerWatts(tuningDefaults.pl1)}W, PL2=${formatPowerWatts(tuningDefaults.pl2)}W, PL4=${formatPowerWatts(tuningDefaults.pl4)}W`);
                 }
                 hasSyncedTuningDefaults = true;
@@ -2923,6 +2923,23 @@ socket.onmessage = (event) => {
             }
             return;
         }
+
+        const backendVersionMatch = rawLog.match(/^TPTS_BACKEND_VERSION:\s*(\S+)/);
+        if (backendVersionMatch) {
+            backendVersionChecked = true;
+            if (backendVersionMatch[1] !== TPTS_APP_VERSION) warnBackendVersion(backendVersionMatch[1]);
+            return;
+        }
+        if (rawLog.includes('TPTS_LIVE_MONITOR_EXITED')) {
+            if (monitorTimer !== null) {
+                monitorTimer = null;
+                setTimeout(() => {
+                    if (isDeviceConnected && monitorTimer === null) startLiveTelemetryLoop();
+                }, 2000);
+            }
+            return;
+        }
+        if (!isPipelineRunning && /^\[(Monitor|Stress)\] /.test(rawLog)) appendConsole(rawLog.trim());
 
         let discoveredTemp = null;
         const hexTokens = rawLog.match(/0x[0-9a-fA-F]+/g);
@@ -2957,16 +2974,18 @@ socket.onmessage = (event) => {
         
         for (const raplMatch of rawLog.matchAll(/RAPL_SAMPLE: DOMAIN=(package|ia|gt) SOURCE=(\S+) E1=(\d+|NA) E2=(\d+|NA) T1_MS=(\d+|NA) T2_MS=(\d+) RANGE=(\d+) UNIT=(\S+) STATUS=(\S+)/g)) {
             const [, domain, source, before, after, start, end, range, unit, status] = raplMatch;
-            if (domain === 'package') latestRaplSamples = {};
+            if (domain === 'package') {
+                latestRaplSamples = {};
+                if (chartingStartPending) {
+                    chartingStartPending = false;
+                    chartingActive = true;
+                }
+            }
             latestRaplSamples[domain] = {
                 source, energy_before: before, energy_after: after,
                 time_before_ms: start, time_after_ms: end, range, unit, status
             };
             awaitingRaplSampleEnd = true;
-        }
-        if (rawLog.includes('TPTS_RAPL_UPDATE_REQUIRED')) {
-            latestRaplSamples = {};
-            appendConsole('[RAPL] Device script is outdated. Reconnect the device to deploy the updated sampler.');
         }
         if (telemetryDebugEnabled && (rawLog.includes('RAPL_NAMED:') || rawLog.includes('RAPL_RAW:') || rawLog.includes('RAPL_SAMPLE:'))) {
             appendConsole(`[RAPL Debug] ${rawLog.trim()}`);
@@ -3062,22 +3081,14 @@ socket.onmessage = (event) => {
             latestIaPower = iaMatch[1] === 'NA' ? null : parseInt(iaMatch[1], 10) / 1000;
             const iaEl = document.getElementById('v-ia-power');
             if (iaEl) iaEl.innerText = latestIaPower === null ? '-- W' : `${latestIaPower.toFixed(2)} W`;
-            renderRestPower(isPipelineRunning);
-            if (isPipelineRunning && iaPowerHistory.length) {
-                iaPowerHistory[iaPowerHistory.length - 1] = latestIaPower;
-                redrawPowerChart();
-            }
+            renderRestPower(false);
         }
         const gtMatch = rawLog.match(/(?:^|\s)GT_MW:\s*(\d+|NA)\b/i);
         if (gtMatch) {
             latestGtPower = gtMatch[1] === 'NA' ? null : parseInt(gtMatch[1], 10) / 1000;
             const gtEl = document.getElementById('v-gt-power');
             if (gtEl) gtEl.innerText = latestGtPower === null ? '-- W' : `${latestGtPower.toFixed(2)} W`;
-            renderRestPower(isPipelineRunning);
-            if (isPipelineRunning && gtPowerHistory.length) {
-                gtPowerHistory[gtPowerHistory.length - 1] = latestGtPower;
-                redrawPowerChart();
-            }
+            renderRestPower(false);
         }
         if (discoveredPower !== undefined) updatePowerChart(discoveredPower);
         const rawFanCountMatch = rawLog.match(/Number of fans\s*=\s*(\d+)/i);
@@ -3180,8 +3191,7 @@ socket.onmessage = (event) => {
                 latestProchot = (thermReg & 4) ? 1 : 0;
                 latestPowerLimit = (thermReg & 1024) ? 1 : 0;
                 
-                // 壓測期間溫度以 SOC_TEMP_CELSIUS 為準，避免 MSR 額外推點造成溫度比功耗快
-                if (discoveredTemp === null && !isPipelineRunning && msrTjMaxC) {
+                if (discoveredTemp === null && msrTjMaxC) {
                     const digitalReadout = (thermReg >> 16) & 0x7F;
                     if (digitalReadout > 0 && digitalReadout < msrTjMaxC) {
                         discoveredTemp = msrTjMaxC - digitalReadout;
@@ -3211,7 +3221,6 @@ socket.onmessage = (event) => {
             updateMonitorEvents();
         }
         if (rawLog.includes('TPTS_SAMPLE_END')) {
-            telemetrySampleStartedAt = 0;
             if (awaitingStructuredSampleEnd && pendingStructuredTemperature !== null) {
                 scheduleChartUpdate(pendingStructuredTemperature);
             }
@@ -3220,7 +3229,12 @@ socket.onmessage = (event) => {
         }
         const tagged64f = rawLog.match(/MSR_64F:\s*(0x[0-9a-fA-F]+|[0-9a-fA-F]+)/i);
         const raw64f = tagged64f ? normalizeHex(tagged64f[1]) : rawLog.includes('TELEMETRY_DATA:') && hexTokens && hexTokens.length >= 3 ? hexTokens[1] : null;
-        if (raw64f) {
+        const cpuLimitSample = decodeCpuLimitSample(rawLog);
+        if (cpuLimitSample) {
+            cpuLimitSampleSeen = true;
+            latestLimitReasons = cpuLimitSample;
+            updateMonitorEvents();
+        } else if (raw64f && !cpuLimitSampleSeen) {
             const decodedReasons = decodeCoreLimitReasons(raw64f);
             if (decodedReasons) {
                 latestLimitReasons = decodedReasons;
@@ -3228,7 +3242,7 @@ socket.onmessage = (event) => {
             }
         }
         const raplSampleComplete = rawLog.includes('TPTS_SAMPLE_END') || rawLog.includes('TPTS_POWER_SAMPLE_END');
-        const stressSampleComplete = rawLog.includes('TPTS_POWER_SAMPLE_END') || (!awaitingRaplSampleEnd && /^PKG_POWER_MW:\s*\d+/i.test(rawLog.trim()));
+        const stressSampleComplete = raplSampleComplete || (!awaitingRaplSampleEnd && /^PKG_POWER_MW:\s*\d+/i.test(rawLog.trim()));
         if (isPipelineRunning && stressSampleComplete) evaluateThermalTuneGuard();
         if (chartingActive && Date.now() >= telemetryHistoryReadyAt && ((awaitingRaplSampleEnd && raplSampleComplete) || (!awaitingRaplSampleEnd && (discoveredTemp !== null || rawLog.includes('TPTS_SAMPLE:'))))) {
             recordTelemetrySample();
@@ -3259,7 +3273,7 @@ socket.onmessage = (event) => {
             }
         }
 
-        if (isPipelineRunning) {
+        if (isPipelineRunning && !TELEMETRY_STREAM_LINE.test(rawLog)) {
             consoleBox.innerText += rawLog;
             trimConsoleLog(consoleBox);
             consoleBox.scrollTop = consoleBox.scrollHeight;
@@ -3329,8 +3343,21 @@ socket.onmessage = (event) => {
     }
 };
 
+function warnBackendVersion(backendVersion) {
+    const message = `[TPTS] Backend version ${backendVersion || 'unknown (older build)'} does not match dashboard ${TPTS_APP_VERSION}. Close the backend window and run start.bat again.`;
+    appendConsole(message);
+    const statusEl = document.getElementById('link-status');
+    if (statusEl) {
+        statusEl.innerText = '[Backend outdated - rerun start.bat]';
+        statusEl.style.color = '#ff6672';
+    }
+    alert(message);
+}
+
 socket.onopen = () => {
     appendConsole(`[TPTS] WebSocket connected (${wsHost}).`);
+    // Builds older than the version handshake never announce themselves.
+    setTimeout(() => { if (!backendVersionChecked) warnBackendVersion(''); }, 3000);
     tryAutoConnectLocal();
 };
 

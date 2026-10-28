@@ -40,6 +40,7 @@
         .form-group { margin-bottom:13px; }
         label { display:flex; justify-content:space-between; gap:8px; margin-bottom:6px; color:var(--muted); font-size:11px; font-weight:600; }
         .current-hint { flex-shrink:0; color:var(--cyan); font-family:Consolas,monospace; font-weight:700; line-height:1.2; white-space:nowrap; }
+        .current-hint.limited-hint { color:#ffb347; cursor:help; }
         input,select,textarea { width:100%; border:1px solid var(--border); border-radius:5px; outline:none; background:var(--deep); color:var(--text); font-family:Consolas,monospace; }
         input,select { height:36px; padding:0 10px; }
         textarea { min-height:260px; padding:10px; resize:vertical; line-height:1.45; font-size:12px; }
@@ -157,6 +158,10 @@
         .event-row.active .event-state { color:#ff6672; }
         .event-row.warn { background:#342b18; color:#ffe0a3; }
         .event-row.warn .event-state { color:var(--orange); }
+        .event-detail { margin-top:-4px; padding:5px 8px; border-radius:4px; background:var(--deep); color:var(--muted); font:10px Consolas,monospace; white-space:pre-wrap; word-break:break-word; user-select:text; }
+        #clip-help { white-space:normal; }
+        #clip-help summary { cursor:pointer; color:var(--text, #c3c8d8); }
+        #clip-help p { margin:4px 0; }
         @media (max-width:1050px) { .metrics { grid-template-columns:repeat(3,1fr); } .tune-grid { grid-template-columns:1fr; } .wide-panel { grid-column:auto; } .stress-controls { grid-template-columns:1fr; } .thermal-json-panel .thermal-json-actions { grid-template-columns:repeat(2,minmax(0,1fr)); } }
         @media (max-width:760px) { .topbar { padding:10px 14px; flex-wrap:wrap; gap:8px; } .brand small,.connection-state { display:none; } .page { padding:10px; } .dashboard-layout { grid-template-columns:1fr; } .metrics { grid-template-columns:repeat(2,1fr); } .metric { height:68px; } .chart-wrap { height:190px; } .power-inputs,.fan-controls,.registers,.connect-row,.thermal-json-meta,.thermal-json-panel .thermal-json-actions,.auto-tune-inputs { grid-template-columns:1fr; } .action-row,.auto-tune-actions { flex-direction:column; } .action-row button,.auto-tune-actions button { width:100%; } }
     </style>
@@ -191,6 +196,17 @@
                         <div class="event-row" data-event-row="prochot" title="OK: PROCHOT is not asserted. ACTIVE: the processor or platform is requesting emergency thermal throttling."><span>PROCHOT</span><span class="event-state">OK</span></div>
                         <div class="event-row" data-event-row="power" title="OK: no package power-limit flag. ACTIVE: the CPU is currently limited by PL1, PL2, or another power policy."><span>PL LIMIT</span><span class="event-state">OK</span></div>
                         <div class="event-row" data-event-row="clip" title="Current CPU core frequency-limit reasons decoded from MSR 0x64F (same names as PTAT IA Clip Reason)."><span>CPU Limit Reason</span><span class="event-state">--</span></div>
+                        <div class="event-detail" id="clip-detail" hidden></div>
+                        <details class="event-detail" id="clip-help" hidden>
+                            <summary>What do these mean?</summary>
+                            <p><b>OK (at max turbo)</b>: only MAX_TURBO_LIMIT / TURBO_ATTEN; the CPU runs as fast as allowed. Normal.</p>
+                            <p><b>Now</b>: limiting frequency at this sample. <b>(CPU2)</b> = only that core reported it; cores are read ~1 ms apart, so this usually means the reason just started or ended.</p>
+                            <p><b>Last 1s</b>: everything seen in the ~100 ms polls since the previous sample.</p>
+                            <p><b>History</b>: happened since boot, not current. TPTS never clears it.</p>
+                            <p><b>MSR 0x64F</b>: raw value; bits 0-13 now, bits 16-29 history.</p>
+                            <p><b>Concern?</b> MAX_TURBO_LIMIT, TURBO_ATTEN: no. PBM_PL1/PBM_PL2: expected under load. THERMAL, PROCHOT, RATL, VR_*: check cooling/power delivery.</p>
+                            <p>Full reference and a worked example: TPTS.md, section "Reading CPU Limit Reason".</p>
+                        </details>
                         <div class="event-row" data-event-row="temperature" title="OK: below 85 °C. HIGH: 85–91 °C. CRITICAL: 92 °C or higher, based on the primary package temperature sensor."><span>High Temperature</span><span class="event-state">OK</span></div>
                         <div class="event-row" data-event-row="fan" title="OK: a fan is detected and reporting RPM. CHECK FAN: temperature is at least 70 °C but all detected fans report 0 RPM."><span>Fan Status</span><span class="event-state">OK</span></div>
                         <div class="event-row" data-event-row="telemetry" title="LIVE: new sensor data received recently. STALE: no new temperature data for more than 3 seconds. WAITING: monitoring has not received data yet."><span>Live Data</span><span class="event-state">Ready</span></div>
@@ -214,7 +230,7 @@
                 <div id="sidebar-tuning" class="sidebar-tab-content" data-requires-connection hidden>
                     <div class="section" id="tab-tuning">
                         <h4>⚡ CPU Power Limits</h4>
-                        <div class="power-inputs"><div class="form-group"><label>PL1 Default <span class="current-hint" id="v-pl1">-- W</span></label><input type="number" id="tune-pl1" placeholder="User setting (W)" min="0" step="0.125"></div><div class="form-group"><label>PL2 Default <span class="current-hint" id="v-pl2">-- W</span></label><input type="number" id="tune-pl2" placeholder="User setting (W)" min="0" step="0.125"></div><div class="form-group"><label>PL4 Default <span class="current-hint" id="v-pl4">-- W</span></label><input type="number" id="tune-pl4" placeholder="User setting (W)" min="0" step="0.125"></div></div>
+                        <div class="power-inputs"><div class="form-group"><label title="Input: value applied by Apply Power Limits (starts at the saved system default). Right: value the device is using now.">PL1 Setting <span class="current-hint" id="v-pl1">-- W</span></label><input type="number" id="tune-pl1" placeholder="User setting (W)" min="0" step="0.125"></div><div class="form-group"><label title="Input: value applied by Apply Power Limits (starts at the saved system default). Right: value the device is using now.">PL2 Setting <span class="current-hint" id="v-pl2">-- W</span></label><input type="number" id="tune-pl2" placeholder="User setting (W)" min="0" step="0.125"></div><div class="form-group"><label title="Input: value applied by Apply Power Limits (starts at the saved system default). Right: value the device is using now.">PL4 Setting <span class="current-hint" id="v-pl4">-- W</span></label><input type="number" id="tune-pl4" placeholder="User setting (W)" min="0" step="0.125"></div></div>
                         <div class="action-row"><button class="primary-button" onclick="applyPowerLimits()">Apply Power Limits</button><button class="secondary-button" onclick="resetPowerLimitsToSystemDefault()">Reset to System Default</button></div>
                     </div>
                     <div class="section">

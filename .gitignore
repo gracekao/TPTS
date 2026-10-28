@@ -10,3 +10,7 @@ logs/*
 *.pdf
 *.PDF
 dist/
+intel_PTAT_android/
+*.msi
+ptat_cli_check.csv
+__pycache__/
