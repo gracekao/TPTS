@@ -45,17 +45,6 @@ Thermal & Power Tuning System for Android device thermal management, stress test
 3. The script opens `http://127.0.0.1:8080` in the device browser.
 4. In dashboard target input, enter `local`, then click **Establish ADB Link**.
 
-## Release Packaging
-
-Build the all-in-one package (requires Go and Python; needs the Go source under `proxy/`):
-
-```
-python tools/build_release.py v1.0.1
-gh release create v1.0.1 dist/TPTS-v1.0.1-full.zip --repo gracekao/TPTS --title "TPTS v1.0.1"
-```
-
-The script rebuilds all three backends with `-trimpath`, adds the Geekbench package (from `stress_apk/` or the `geekbench-7.0.0` Release), adds Linux `adb` from Google platform-tools, and writes `dist/TPTS-<version>-full.zip` with one top-level `TPTS/` folder and Unix exec permissions.
-
 Windows fallback: if `stress_apk/` is missing, selecting the **Geekbench 7** mode runs `download_geekbench.bat`, which downloads the public Release asset with the built-in `curl.exe` (no GitHub CLI or sign-in needed).
 
 ### Cross-Platform Runtime Rules
@@ -113,8 +102,6 @@ RAPL samples remain unavailable on the first reading, when a source or energy un
 Some devices reset the package energy counter every few seconds (observed on `10.225.75.73`; both sysfs and MSR `0x611` drop to near zero while IA/GT counters keep counting). Package Power is therefore read about every 100 ms inside each one-second window; intervals that contain a reset are skipped, and power is the valid energy divided by the valid time. The status is `partial:<skipped>/<valid ms>` when intervals were skipped. On `10.225.75.23`, this method matched PTAT's `Power-Package Power` within about 3% on average over a synchronized 27-second idle comparison.
 
 `RAPL_SAMPLE` diagnostics record each domain's source, raw energy before/after, monotonic timestamps, counter range, unit, and status. These fields are included in the stress CSV and in dashboard CSV exports for selected power metrics. Enable Telemetry Debug Log to also inspect them in System Log. Reconnect the device after updating the app so the backend deploys the matching script and restarts the sampler.
-
-Run frontend regression checks with `node tools/test_rapl.js`. Add `--serial <adb-target>` to also validate shell arithmetic and sample-state transitions on a rooted Android device without starting workloads or changing hardware settings. On Linux, set `ADB` to the ADB executable path if it is not on `PATH`.
 
 | Dashboard data | Primary source | Fallback / calculation | Unit | Used by |
 | --- | --- | --- | --- | --- |
@@ -199,8 +186,6 @@ TPTS/
 ├── start_android.sh       # Android launcher (local mode)
 ├── download_geekbench.bat # Windows fallback Geekbench download
 ├── TPTS.md                # Documentation
-├── tools/
-│   └── build_release.py   # Builds dist/TPTS-<version>-full.zip
 ├── stress_apk/            # Geekbench 7 package (in full release ZIP)
 ├── app/
 │   ├── index.html         # Dashboard UI
@@ -210,9 +195,6 @@ TPTS/
 │   └── run_stressapp.sh
 ├── logs/                  # MSR telemetry CSV logs
 └── proxy/
-        ├── main.go            # Cross-platform backend source
-        ├── go.mod
-        ├── go.sum
     ├── adb.exe            # Android Debug Bridge (Windows)
     ├── adb                # Android Debug Bridge (Linux, full release ZIP only)
     ├── AdbWinApi.dll
