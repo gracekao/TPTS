@@ -183,15 +183,36 @@ function copyLog(btn) {
 
 function switchSidebarTab(tabName) {
     document.querySelectorAll('[data-sidebar-tab]').forEach((button) => {
-        button.classList.toggle('active', button.dataset.sidebarTab === tabName);
+        const active = button.dataset.sidebarTab === tabName;
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-selected', String(active));
     });
     document.querySelectorAll('.sidebar-tab-content').forEach((content) => {
         content.hidden = content.id !== `sidebar-${tabName}`;
     });
-    if (tabName === 'tuning' && isDeviceConnected) {
+    if ((tabName === 'tuning' || tabName === 'autotune') && isDeviceConnected) {
         clearTuningUserEditedFlags();
         requestTuningDefaults(true);
     }
+    if (tabName === 'autotune') {
+        syncAutoTuneStartHint();
+        toggleStressWorkloadOptions();
+    }
+}
+
+// The Auto Tune tab shows which PL1 it will start from, since the PL1 input lives in Manual Tune.
+function syncAutoTuneStartHint() {
+    const hintEl = document.getElementById('auto-tune-start-pl1');
+    if (!hintEl) return;
+    const pl1 = Number(document.getElementById('tune-pl1')?.value);
+    hintEl.innerText = Number.isFinite(pl1) && pl1 > 0 ? `${formatPowerWatts(pl1)} W` : '-- W';
+}
+
+function renderPowerLimitDefaultsHint() {
+    const hintEl = document.getElementById('pl-defaults-hint');
+    if (!hintEl) return;
+    const values = [tuningDefaults.pl1, tuningDefaults.pl2, tuningDefaults.pl4];
+    hintEl.innerText = values.every((value) => Number.isFinite(value)) ? `(${values.map(formatPowerWatts).join(' / ')} W)` : '';
 }
 
 function syncConnectionUi() {
@@ -364,6 +385,7 @@ function renderFanSpeeds() {
     fanEl.innerText = fanRpms.map((rpm, index) => `F${index + 1}: ${rpm ?? '--'}`).join('\n');
     fanEl.title = fanRpms.map((rpm, index) => `Fan ${index}: ${rpm ?? '--'} RPM`).join('\n');
     syncFanControlInputs();
+    renderFanAutoHint();
 }
 
 // Bit layout of MSR_CORE_PERF_LIMIT_REASONS (0x64F), matching SDM Table 2-39 and PTAT naming.
@@ -912,10 +934,24 @@ function renderFanControlInputs() {
         group.appendChild(input);
         container.appendChild(group);
     }
-    container.style.opacity = isManual ? '1.0' : '0.4';
+    container.hidden = !isManual;
+    container.style.opacity = '1.0';
+    renderFanAutoHint();
 
     const hintEl = document.getElementById('fan-count-hint');
-    if (hintEl) hintEl.innerText = detectedFanCount > 0 ? `${detectedFanCount} fans` : '-- fans';
+    if (hintEl) hintEl.innerText = detectedFanCount > 0 ? `${detectedFanCount} fan${detectedFanCount === 1 ? '' : 's'} detected` : 'no fan detected';
+}
+
+function renderFanAutoHint() {
+    const autoHint = document.getElementById('fan-auto-hint');
+    if (!autoHint) return;
+    const isManual = document.getElementById('tune-fan-mode')?.value === 'manual';
+    autoHint.hidden = isManual;
+    if (isManual) return;
+    const liveRpms = detectedFanRpms.slice(0, detectedFanCount).filter((rpm) => Number.isFinite(rpm));
+    autoHint.innerText = liveRpms.length
+        ? `The EC controls fan speed (now ${liveRpms.join(' / ')} RPM). Switch to Manual RPM to set a fixed speed.`
+        : 'The EC controls fan speed. Switch to Manual RPM to set a fixed speed.';
 }
 
 function syncFanControlInputs() {
@@ -1405,8 +1441,8 @@ function restoreAllUiToIdle(resumeMonitoring = true) {
 
     const runBtn = document.querySelector('button[onclick="startThermalPipeline()"]');
     if (runBtn) {
-        runBtn.innerText = "Start Stress Test";
-        runBtn.style.background = "#ff2670"; runBtn.style.color = "#ffffff";
+        runBtn.innerText = isGeekbenchMode() ? "Start Geekbench" : "Start Stress Test";
+        runBtn.style.background = ""; runBtn.style.color = "";
     }
 
     const monitorBtn = document.querySelector('.btn-secondary');
@@ -1446,6 +1482,23 @@ function toggleStressWorkloadOptions() {
     if (geekbenchPanel) geekbenchPanel.hidden = !geekbenchEnabled;
     const startButton = document.getElementById('stress-start-button');
     if (startButton && !isPipelineRunning) startButton.innerText = geekbenchEnabled ? 'Start Geekbench' : 'Start Stress Test';
+    const stressCaption = document.getElementById('stress-run-caption');
+    if (stressCaption) stressCaption.innerText = geekbenchEnabled
+        ? 'Runs Geekbench alone with the current PL1. Scores and telemetry are saved when it completes.'
+        : 'Runs the workload only. Watch temperature, power, and throttle status.';
+    const autoTuneButton = document.getElementById('auto-tune-start-button');
+    const autoTuneCaption = document.getElementById('auto-tune-run-caption');
+    if (autoTuneButton && !isPipelineRunning) {
+        autoTuneButton.disabled = geekbenchEnabled;
+        autoTuneButton.style.opacity = geekbenchEnabled ? '0.6' : '1.0';
+        autoTuneButton.style.cursor = geekbenchEnabled ? 'not-allowed' : 'pointer';
+    }
+    if (autoTuneCaption) {
+        autoTuneCaption.classList.toggle('disabled-reason', geekbenchEnabled);
+        autoTuneCaption.innerText = geekbenchEnabled
+            ? 'Not available in Geekbench 7 mode: changing PL1 during the run would distort scores. Select Stress Workloads to use Auto Tune.'
+            : 'Runs the workload and lowers PL1 in steps when a limit is exceeded. Exports a Power Profile when done.';
+    }
     if (isPipelineRunning) return;
 
     const aquariumEnabled = document.querySelector('input[name="stress-workload"][value="aquarium"]')?.checked;
@@ -2214,6 +2267,7 @@ function finishAutoTuneDryRun() {
         adjustments: autoTuneDryRun.adjustments
     };
     renderThermalTuneResult(autoTuneDryRun, thermalTuneTrigger);
+    document.getElementById('auto-tune-result')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     if (statusEl) statusEl.innerText = thermalTuneTriggered
         ? 'Auto Tune completed. Download the generated power profile for review.'
         : `Auto Tune completed without PL1 changes. SoC used a ${getThermalTuneSocWindowSeconds()}s average reference.`;
@@ -2901,6 +2955,8 @@ socket.onmessage = (event) => {
                     setTuningFieldDefault('tune-pl1', tuningDefaults.pl1);
                     setTuningFieldDefault('tune-pl2', tuningDefaults.pl2);
                     setTuningFieldDefault('tune-pl4', tuningDefaults.pl4);
+                    renderPowerLimitDefaultsHint();
+                    syncAutoTuneStartHint();
                     appendConsole(`[Tuning] System defaults saved: PL1=${formatPowerWatts(tuningDefaults.pl1)}W, PL2=${formatPowerWatts(tuningDefaults.pl2)}W, PL4=${formatPowerWatts(tuningDefaults.pl4)}W`);
                 }
                 hasSyncedTuningDefaults = true;
@@ -3326,7 +3382,8 @@ socket.onmessage = (event) => {
             }
 
             const tuningTab = document.getElementById('sidebar-tuning');
-            if (tuningTab && !tuningTab.hidden) {
+            const autoTuneTab = document.getElementById('sidebar-autotune');
+            if ((tuningTab && !tuningTab.hidden) || (autoTuneTab && !autoTuneTab.hidden)) {
                 clearTuningUserEditedFlags();
                 setTimeout(() => requestTuningDefaults(true), 350);
                 setTimeout(() => {
@@ -3383,6 +3440,7 @@ window.addEventListener('load', () => {
         if (!el) return;
         el.addEventListener('input', () => {
             el.dataset.userEdited = "1";
+            if (id === 'tune-pl1') syncAutoTuneStartHint();
         });
     });
 

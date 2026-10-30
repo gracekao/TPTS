@@ -14,19 +14,20 @@ Thermal & Power Tuning System for Android device thermal management, stress test
    - Enter the device IP in the **Device Connection** panel.
    - Click **Establish ADB Link**.
    - The Go backend prepares `iotools` and the MSR device node.
-   - Wait for status `[Connected]`, then open **Thermal Tune** to load the real PL1/PL2/PL4 defaults.
+   - Wait for status `[Connected]`, then open **Manual Tune** to load the real PL1/PL2/PL4 defaults.
 
 3. **Pre-Test Setup**:
    - Verify device connection status shows `[Connected]` (system ready for tuning & monitoring)
 
 4. **Tune or Test**:
         - Use **Live Monitor** to view real-time temperature, power, fan, and selected thermal-zone metrics.
-        - Use **Thermal Tune** to change CPU power limits, select automatic/manual fan control, or select one or more stress workloads.
+        - Use **Manual Tune** to change CPU power limits, select automatic/manual fan control, or edit the thermal HAL JSON.
+        - Use **Stress & Auto Tune**: step 1 selects the workload, step 2 sets the optional Auto Tune limits, step 3 has **Start Stress Test** (workload only) and **Start Auto Tune** (workload plus stepwise PL1 control).
         - Before a stress test, TPTS closes Chrome and Settings, returns to the Android launcher, and clears background app processes.
         - WebGL Aquarium runs Chrome in fullscreen; system bars are restored when the test completes or is stopped.
         - **WebGL Aquarium** runs in Chrome at 60 FPS with a 1024 × 1024 canvas; choose 1 to 30,000 fish.
         - Click **Start Stress Test** and review Temperature, Power, and Throttle Status for the selected duration.
-        - To benchmark, switch the Stress Test mode to **Geekbench 7**, choose the CPU/GPU benchmark, and click **Start Geekbench**. Geekbench runs alone (other stress workloads are disabled; the backend also enforces this), and telemetry records until it completes.
+        - To benchmark, switch the Workload mode to **Geekbench 7**, choose the CPU/GPU benchmark, and click **Start Geekbench**. Geekbench runs alone (other stress workloads are disabled; the backend also enforces this), and telemetry records until it completes.
 
 ## Quick Start (Linux, Technical)
 

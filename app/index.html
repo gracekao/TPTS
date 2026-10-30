@@ -25,15 +25,25 @@
         @keyframes page-in { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:translateY(0); } }
         .dashboard-layout { display:grid; grid-template-columns:292px minmax(0,1fr); gap:16px; max-width:1600px; margin:0 auto; }
         .sidebar,.panel { background:var(--surface); border:1px solid var(--border); border-radius:8px; }
-        .sidebar { padding:18px; align-self:start; }
+        .sidebar { background:none; border:0; padding:0; align-self:start; display:grid; gap:14px; }
+        .sidebar-connect { padding:18px; }
         .sidebar-title,.panel-title { display:flex; align-items:center; gap:9px; margin:0; color:var(--cyan); font-size:16px; }
         .sidebar-title { padding-bottom:14px; border-bottom:1px solid var(--border); font-size:20px; }
         .section { padding:17px 0; border-bottom:1px solid var(--border); }
         .section:last-child { border-bottom:0; padding-bottom:0; }
         .section h4 { display:flex; align-items:flex-start; gap:7px; margin:0 0 13px; color:var(--cyan); font-size:14px; }
-        .monitor-tabs { display:flex; gap:20px; margin-bottom:13px; border-bottom:1px solid var(--border); }
-        .monitor-tab { width:auto; margin:0; padding:8px 10px 9px; border:0; border-bottom:2px solid transparent; background:none; color:var(--muted); font-size:12px; font-weight:700; }
-        .monitor-tab.active { color:var(--cyan); border-bottom-color:var(--cyan); }
+        .tab-pages { display:block; }
+        .monitor-tabs { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:4px; align-items:stretch; padding:0 8px; }
+        .monitor-tab { position:relative; top:1px; display:grid; align-content:center; justify-items:center; gap:3px; width:auto; min-width:0; min-height:52px; margin:0; padding:8px 2px 7px; border:1px solid var(--border); border-bottom:0; border-radius:8px 8px 0 0; background:var(--deep); color:var(--muted); font-size:10.5px; font-weight:700; line-height:1.15; white-space:normal; cursor:pointer; }
+        .monitor-tab .tab-icon { font-size:15px; line-height:1; opacity:.7; }
+        .monitor-tab:hover { color:#dce3f6; background:#161a2a; }
+        .monitor-tab.active { z-index:1; background:var(--surface); color:#fff; box-shadow:inset 0 3px 0 var(--cyan); }
+        .monitor-tab.active .tab-icon { opacity:1; }
+        .sidebar-tab-content { padding:0 18px 18px; border:1px solid var(--border); border-radius:8px; background:var(--surface); animation:page-in .22s ease-out; }
+        .page-head { padding:14px 0 13px; border-bottom:1px solid var(--border); }
+        .page-index { display:block; margin-bottom:4px; color:var(--muted); font-size:10px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }
+        .page-head h3 { margin:0; color:#fff; font-size:15px; }
+        .page-head p { margin:5px 0 0; color:var(--muted); font-size:11px; line-height:1.45; }
         .sidebar-tab-content[hidden] { display:none; }
         [data-requires-connection][hidden] { display:none; }
         .connection-ready-note { margin:0; color:#b8c0d5; font-size:12px; line-height:1.5; }
@@ -87,6 +97,7 @@
         .power-inputs { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-top:17px; }
         .fan-controls { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:17px; }
         .fan-rpm-rows { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:12px; margin-top:12px; }
+        .fan-rpm-rows[hidden] { display:none; }
         .action-row { display:flex; gap:10px; margin-top:7px; } .action-row button { width:auto; min-width:170px; }
         .stress-controls { display:grid; grid-template-columns:220px 1fr 1fr; gap:12px; align-items:end; margin-top:17px; }
         .stress-controls button { margin:0; } #pipeline-countdown { margin-top:9px; color:var(--muted); font:12px Consolas,monospace; }
@@ -151,6 +162,21 @@
         .auto-tune-summary .tune-action { color:#facc15; font-weight:700; }
         .auto-tune-summary .tune-muted { color:#8990aa; }
         .auto-tune-actions { display:flex; gap:9px; } .auto-tune-actions button { margin:0; }
+        .section-sub { margin:-6px 0 12px; color:#aeb6cd; font-size:11px; line-height:1.5; }
+        .section-sub b { color:#dce3f6; } .section-sub code { color:var(--cyan); font-size:10.5px; }
+        .step-badge { display:inline-grid; place-items:center; width:20px; height:20px; border-radius:50%; background:var(--cyan); color:#06111c; font-size:12px; font-weight:800; }
+        .field-group-title { margin:10px 0 7px; color:#8f99b4; font-size:10px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; }
+        .unit-field { position:relative; } .unit-field input { padding-right:40px; }
+        .unit-field .unit { position:absolute; right:10px; top:50%; transform:translateY(-50%); pointer-events:none; color:var(--muted); font:600 11px Consolas,monospace; }
+        .button-sub { display:block; margin-top:2px; color:#9aa5c2; font-size:10px; font-weight:500; }
+        .button-sub:empty { display:none; }
+        .run-option { margin-bottom:12px; } .run-option button { margin-bottom:5px; }
+        .run-caption { margin:0; color:#aeb6cd; font-size:10.5px; line-height:1.45; }
+        .run-caption.disabled-reason { color:var(--orange); }
+        #auto-tune-start-button { background:#15803d; }
+        #auto-tune-start-button:disabled { background:#2a3448; }
+        .sidebar .lamps { gap:0; justify-content:space-between; padding:11px 13px; }
+        .sidebar .lamp-item { font-size:10px; white-space:nowrap; }
         .event-list { display:grid; gap:7px; }
         .event-row { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:7px 8px; border-radius:4px; background:var(--deep); color:#b8c0d5; font:11px Consolas,monospace; }
         .event-state { color:var(--green); font-weight:700; }
@@ -176,14 +202,18 @@
     <main id="page-dashboard" class="page active">
         <div class="dashboard-layout">
             <aside class="sidebar">
+                <div class="panel sidebar-connect">
                 <h2 class="sidebar-title"><span>⚡</span> Controls & Settings</h2>
                 <div class="section">
                     <h4>⌁ Device Connection</h4>
                     <div class="connect-row"><input type="text" id="ip" value="10.225.75.45" placeholder="10.225.75.45:5555 or local" onkeydown="if (event.key === 'Enter' && !event.isComposing) { event.preventDefault(); connectDevice(); }"><button class="primary-button" onclick="connectDevice()">Establish ADB Link</button></div>
                 </div>
                 <p class="connection-ready-note" id="connection-ready-note">Enter the device IP, then establish the ADB link.</p>
-                <div class="monitor-tabs" data-requires-connection role="tablist" aria-label="Dashboard controls"><button class="monitor-tab active" data-sidebar-tab="live" onclick="switchSidebarTab('live')">Live Monitor</button><button class="monitor-tab" data-sidebar-tab="tuning" onclick="switchSidebarTab('tuning')">Thermal Tune</button></div>
-                <div id="sidebar-live" class="sidebar-tab-content" data-requires-connection>
+                </div>
+                <div class="tab-pages" data-requires-connection>
+                <div class="monitor-tabs" role="tablist" aria-label="Dashboard pages"><button class="monitor-tab active" role="tab" aria-selected="true" data-sidebar-tab="live" onclick="switchSidebarTab('live')"><span class="tab-icon">📈</span>Live Monitor</button><button class="monitor-tab" role="tab" aria-selected="false" data-sidebar-tab="tuning" onclick="switchSidebarTab('tuning')"><span class="tab-icon">🎛</span>Manual Tune</button><button class="monitor-tab" role="tab" aria-selected="false" data-sidebar-tab="autotune" onclick="switchSidebarTab('autotune')"><span class="tab-icon">🔥</span>Stress &amp; Auto Tune</button></div>
+                <div id="sidebar-live" class="sidebar-tab-content" role="tabpanel">
+                <div class="page-head"><span class="page-index">Page 1 / 3</span><h3>📈 Live Monitor</h3><p>Watch live temperature, power, and fan data; export the CSV log.</p></div>
                 <div class="section">
                     <div class="monitor-control-row"><button class="primary-button btn-secondary" onclick="startLiveTelemetry()">Start Monitoring</button><span id="monitor-elapsed" class="monitor-elapsed">Monitor: 0s</span></div>
                     <button class="success-button" onclick="exportTelemetryLog()" title="Exports one row per second since Start Monitoring was pressed.">⇩ Export CSV Log</button>
@@ -227,20 +257,38 @@
                     </div>
                 </div>
                 </div>
-                <div id="sidebar-tuning" class="sidebar-tab-content" data-requires-connection hidden>
+                <div id="sidebar-tuning" class="sidebar-tab-content" role="tabpanel" hidden>
+                    <div class="page-head"><span class="page-index">Page 2 / 3</span><h3>🎛 Manual Tune</h3><p>Set power limits, fan mode, and the thermal HAL JSON by hand.</p></div>
                     <div class="section" id="tab-tuning">
                         <h4>⚡ CPU Power Limits</h4>
-                        <div class="power-inputs"><div class="form-group"><label title="Input: value applied by Apply Power Limits (starts at the saved system default). Right: value the device is using now.">PL1 Setting <span class="current-hint" id="v-pl1">-- W</span></label><input type="number" id="tune-pl1" placeholder="User setting (W)" min="0" step="0.125"></div><div class="form-group"><label title="Input: value applied by Apply Power Limits (starts at the saved system default). Right: value the device is using now.">PL2 Setting <span class="current-hint" id="v-pl2">-- W</span></label><input type="number" id="tune-pl2" placeholder="User setting (W)" min="0" step="0.125"></div><div class="form-group"><label title="Input: value applied by Apply Power Limits (starts at the saved system default). Right: value the device is using now.">PL4 Setting <span class="current-hint" id="v-pl4">-- W</span></label><input type="number" id="tune-pl4" placeholder="User setting (W)" min="0" step="0.125"></div></div>
-                        <div class="action-row"><button class="primary-button" onclick="applyPowerLimits()">Apply Power Limits</button><button class="secondary-button" onclick="resetPowerLimitsToSystemDefault()">Reset to System Default</button></div>
+                        <p class="section-sub">Input = value to apply. <b>Now</b> = value the device is using.</p>
+                        <div class="power-inputs">
+                            <div class="form-group"><label title="Input: value applied by Apply Power Limits (starts at the saved system default). Right: value the device is using now.">PL1 <span class="current-hint" id="v-pl1">Now: -- W</span></label><div class="unit-field"><input type="number" id="tune-pl1" placeholder="--" min="0" step="0.125"><span class="unit">W</span></div></div>
+                            <div class="form-group"><label title="Input: value applied by Apply Power Limits (starts at the saved system default). Right: value the device is using now.">PL2 <span class="current-hint" id="v-pl2">Now: -- W</span></label><div class="unit-field"><input type="number" id="tune-pl2" placeholder="--" min="0" step="0.125"><span class="unit">W</span></div></div>
+                            <div class="form-group"><label title="Input: value applied by Apply Power Limits (starts at the saved system default). Right: value the device is using now.">PL4 <span class="current-hint" id="v-pl4">Now: -- W</span></label><div class="unit-field"><input type="number" id="tune-pl4" placeholder="--" min="0" step="0.125"><span class="unit">W</span></div></div>
+                        </div>
+                        <div class="action-row"><button class="primary-button" onclick="applyPowerLimits()">Apply Power Limits</button><button class="secondary-button" onclick="resetPowerLimitsToSystemDefault()">Reset to System Default <span class="button-sub" id="pl-defaults-hint"></span></button></div>
                     </div>
                     <div class="section">
-                        <h4>♨ Fan Control <span class="current-hint" id="fan-count-hint" style="margin-left:auto">-- fans</span></h4>
-                        <div class="fan-controls"><div class="form-group"><label>Control Mode</label><select id="tune-fan-mode" onchange="toggleFanInput()"><option value="auto">Automatic (autofanctrl)</option><option value="manual">Manual RPM</option></select></div></div>
-                        <div class="fan-rpm-rows" id="fan-rpm-rows" style="opacity:.4"></div>
+                        <h4>♨ Fan Control <span class="current-hint" id="fan-count-hint" style="margin-left:auto">--</span></h4>
+                        <div class="fan-controls"><div class="form-group"><label>Control Mode</label><select id="tune-fan-mode" onchange="toggleFanInput()"><option value="auto">Automatic (EC autofanctrl)</option><option value="manual">Manual RPM</option></select></div></div>
+                        <p class="section-sub" id="fan-auto-hint">The EC controls fan speed. Switch to Manual RPM to set a fixed speed.</p>
+                        <div class="fan-rpm-rows" id="fan-rpm-rows" hidden></div>
                         <div class="action-row"><button class="primary-button" onclick="applyFanSettings()">Apply Fan Settings</button></div>
                     </div>
+                    <div class="section" id="tab-thermal-json">
+                        <h4>🧩 Thermal HAL JSON</h4>
+                        <p class="section-sub">View or edit <code>thermal_info_config.json</code> on the device. A backup is kept for Restore Default.</p>
+                        <button class="primary-button" onclick="openThermalJsonEditor(true)">Load from Device &amp; Edit</button>
+                        <button class="secondary-button" onclick="openThermalJsonEditor(false)">Open Editor Only</button>
+                        <div class="thermal-json-status" id="thermal-json-status"></div>
+                    </div>
+                </div>
+                <div id="sidebar-autotune" class="sidebar-tab-content" role="tabpanel" hidden>
+                    <div class="page-head"><span class="page-index">Page 3 / 3</span><h3>🔥 Stress &amp; Auto Tune</h3><p>Run a workload, optionally with automatic PL1 control, in three steps.</p></div>
                     <div class="section" id="tab-stress-test">
-                        <h4>🔥 Stress Test <span class="current-hint" style="margin-left:auto">Auto Tune workload</span></h4>
+                        <h4><span class="step-badge">1</span> Workload</h4>
+                        <p class="section-sub">Used by both Start buttons below.</p>
                         <div class="stress-mode" role="radiogroup" aria-label="Test mode">
                             <label><input type="radio" name="stress-mode" value="stress" checked onchange="toggleStressWorkloadOptions()"><span>Stress Workloads</span></label>
                             <label><input type="radio" name="stress-mode" value="geekbench" onchange="toggleStressWorkloadOptions()"><span>Geekbench 7</span></label>
@@ -249,7 +297,7 @@
                             <label class="stress-workload"><input type="checkbox" name="stress-workload" value="stressapptest" checked><span><strong>stressapptest</strong><small>CPU and memory workload</small></span></label>
                             <label class="stress-workload"><input type="checkbox" name="stress-workload" value="aquarium" onchange="toggleStressWorkloadOptions()"><span><strong>WebGL Aquarium</strong><small>Chrome, 60 FPS, 1024 × 1024 canvas</small></span></label>
                             <div class="fish-count-control"><label for="aquarium-fish-count">Fish count (min 1)</label><input id="aquarium-fish-count" aria-label="Number of Fish" type="number" min="1" step="1" value="30000" disabled></div>
-                            <div class="form-group"><label for="duration">Duration (sec)</label><input type="number" id="duration" value="30" min="5" max="3600"></div>
+                            <div class="form-group"><label for="duration">Duration</label><div class="unit-field"><input type="number" id="duration" value="30" min="5" max="3600"><span class="unit">sec</span></div></div>
                         </div>
                         <div class="stress-workloads" id="geekbench-mode-panel" hidden>
                             <div class="gb-progress">Geekbench runs alone (no other stress workloads), offline with no upload. Telemetry records until the benchmark completes.</div>
@@ -260,22 +308,38 @@
                                 <div class="gb-progress" id="geekbench-estimate" style="grid-column:1/-1" hidden></div>
                             </div>
                         </div>
-                        <button class="danger-button" id="stress-start-button" onclick="startThermalPipeline()">Start Stress Test</button>
-                        <div id="pipeline-countdown">Countdown: --</div>
-                        <div class="lamps"><div class="lamp-item"><span class="lamp" id="lamp-thermal"></span>TCC</div><div class="lamp-item"><span class="lamp" id="lamp-prochot"></span>PROCHOT</div><div class="lamp-item"><span class="lamp" id="lamp-power"></span>PL LIMIT</div></div>
                     </div>
                     <div class="section" id="tab-auto-tune">
-                        <h4>⚙ Thermal Tune <span class="current-hint" style="margin-left:auto">Live control</span></h4>
-                        <div class="auto-tune-inputs"><div class="form-group"><label>SOC Temperature Limit (°C)</label><input id="auto-tune-soc-target" type="number" value="85" min="1" max="120"></div><div class="form-group"><label>SOC Averaging Period (sec)</label><input id="auto-tune-soc-window" type="number" value="5" min="1" max="60" step="1"></div><div class="form-group"><label>TSR0 Temperature Limit (°C)</label><input id="auto-tune-tsr0-target" type="number" value="60" min="1" max="120"></div><div class="form-group"><label>TSR1 Temperature Limit (°C)</label><input id="auto-tune-tsr1-target" type="number" value="60" min="1" max="120"></div></div>
-                        <div class="auto-tune-inputs"><div class="form-group"><label>PL1 Step (W)</label><input id="auto-tune-pl1-step" type="number" value="1" min="0.125" max="20" step="0.125"></div><div class="form-group"><label>Minimum PL1 (W)</label><input id="auto-tune-pl1-min" type="number" value="5" min="0.125" max="200" step="0.125"></div><div class="form-group auto-tune-step"><label>Recovery Hold (sec)</label><input id="auto-tune-settle-seconds" type="number" value="15" min="5" max="300" step="1"></div></div>
-                        <div class="action-row"><button class="success-button" onclick="startAutoTuneDryRun()">Start Thermal Tune</button></div>
-                        <div class="thermal-json-status" id="auto-tune-status">Auto Tune uses EC automatic fan control. SoC is evaluated with the selected averaging period; PL1 changes in steps and recovers only after the recovery hold.</div>
+                        <h4><span class="step-badge">2</span> Auto Tune Limits <span class="current-hint" style="margin-left:auto">optional</span></h4>
+                        <p class="section-sub">Only used by <b>Start Auto Tune</b>. PL1 drops one step when a limit is exceeded and recovers after the hold.</p>
+                        <p class="field-group-title">Temperature limits</p>
+                        <div class="auto-tune-inputs">
+                            <div class="form-group"><label>SoC limit</label><div class="unit-field"><input id="auto-tune-soc-target" type="number" value="85" min="1" max="120"><span class="unit">°C</span></div></div>
+                            <div class="form-group"><label>SoC averaging</label><div class="unit-field"><input id="auto-tune-soc-window" type="number" value="5" min="1" max="60" step="1"><span class="unit">sec</span></div></div>
+                            <div class="form-group"><label>TSR0 limit</label><div class="unit-field"><input id="auto-tune-tsr0-target" type="number" value="60" min="1" max="120"><span class="unit">°C</span></div></div>
+                            <div class="form-group"><label>TSR1 limit</label><div class="unit-field"><input id="auto-tune-tsr1-target" type="number" value="60" min="1" max="120"><span class="unit">°C</span></div></div>
+                        </div>
+                        <p class="field-group-title">PL1 control</p>
+                        <div class="auto-tune-inputs">
+                            <div class="form-group"><label>Step</label><div class="unit-field"><input id="auto-tune-pl1-step" type="number" value="1" min="0.125" max="20" step="0.125"><span class="unit">W</span></div></div>
+                            <div class="form-group"><label>Minimum PL1</label><div class="unit-field"><input id="auto-tune-pl1-min" type="number" value="5" min="0.125" max="200" step="0.125"><span class="unit">W</span></div></div>
+                            <div class="form-group auto-tune-step"><label>Recovery hold</label><div class="unit-field"><input id="auto-tune-settle-seconds" type="number" value="15" min="5" max="300" step="1"><span class="unit">sec</span></div></div>
+                        </div>
+                        <p class="section-sub">Starting PL1 comes from <b>Manual Tune</b>: <span class="current-hint" id="auto-tune-start-pl1">-- W</span></p>
                     </div>
-                    <div class="section" id="tab-thermal-json">
-                        <h4>🧩 Thermal JSON Configuration <span class="current-hint" style="margin-left:auto">Edit device JSON</span></h4>
-                        <button class="primary-button" onclick="openThermalJsonEditor(true)">Open JSON Editor</button>
-                        <button class="secondary-button" onclick="openThermalJsonEditor(false)">Show Editor Only</button>
-                        <div class="thermal-json-status" id="thermal-json-status">View and modify the device thermal JSON configuration. Backup and restore available.</div>
+                    <div class="section" id="tab-run">
+                        <h4><span class="step-badge">3</span> Run</h4>
+                        <div class="run-option">
+                            <button class="primary-button" id="stress-start-button" onclick="startThermalPipeline()">Start Stress Test</button>
+                            <p class="run-caption" id="stress-run-caption">Runs the workload only. Watch temperature, power, and throttle status.</p>
+                        </div>
+                        <div class="run-option">
+                            <button class="success-button" id="auto-tune-start-button" onclick="startAutoTuneDryRun()">Start Auto Tune</button>
+                            <p class="run-caption" id="auto-tune-run-caption">Runs the workload and lowers PL1 in steps when a limit is exceeded. Exports a Power Profile when done.</p>
+                        </div>
+                        <div id="pipeline-countdown">Countdown: --</div>
+                        <div class="lamps"><div class="lamp-item"><span class="lamp" id="lamp-thermal"></span>TCC</div><div class="lamp-item"><span class="lamp" id="lamp-prochot"></span>PROCHOT</div><div class="lamp-item"><span class="lamp" id="lamp-power"></span>PL&nbsp;LIMIT</div></div>
+                        <div class="thermal-json-status" id="auto-tune-status"></div>
                     </div>
                     <!-- Hardware Registers are retained for future use; remove these comment markers to show them.
                     <div class="section" id="tab-monitor">
@@ -283,6 +347,7 @@
                         <div class="registers"><div class="register"><span>MSR 0x610</span><strong id="v610">0x00000000</strong></div><div class="register"><span>MSR 0x64F</span><strong id="v64f">0x00000000</strong></div></div>
                     </div>
                     -->
+                </div>
                 </div>
             </aside>
             <section class="dashboard-main">

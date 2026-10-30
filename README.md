@@ -15,11 +15,14 @@ Thermal & Power Tuning System for Android device thermal management, stress test
 1. Double-click `TPTS\start.bat` — it starts the local dashboard and opens `http://localhost:8080`.
 2. Enter the Android target IP (for example, `10.225.75.45:5555`) and click **Establish ADB Link**.
 3. When the status changes to `[Connected]`, use **Live Monitor** for real-time temperatures, package power, and fan speed. To view IA or GT power, select **IA Power** and/or **GT Power** in the metric list. Click **Start Monitoring** to draw the live charts and enable CSV logging. IA/GT readings require a supported Intel RAPL domain; a GT reading of `0 W` can mean no GT energy change during that sample.
-4. Open **Thermal Tune** to manage:
-	- **CPU Power Limits**: PL1, PL2, and PL4. Device values load as the starting defaults; use **Reset to System Default** to restore them.
-	- **Fan Control**: leave Automatic selected or switch to Manual and set an RPM per detected fan.
-	- **Auto Tune**: set the temperature limits, SoC averaging period, PL1 step, minimum PL1, and recovery hold. Select the workloads and duration before starting. Auto Tune leaves fan control to the EC, adjusts PL1 in steps, and exports a Power Profile when complete; it does not edit the device thermal JSON.
-	- **Stress Test**: choose a mode at the top. In **Stress Workloads** mode, select workloads, enter a duration, then review thermal, power, and throttle status. Before starting, TPTS closes Chrome and Settings, returns Android to its launcher, and clears background app processes. WebGL Aquarium runs Chrome in fullscreen and restores system bars when complete. Workloads are `stressapptest` and WebGL Aquarium (1 to 30,000 fish). **Geekbench 7** mode runs only the Geekbench CPU/GPU benchmark (no other stress workloads, so scores are not distorted). It runs with `--no-upload`, has no duration setting, and telemetry continues until the benchmark completes. Auto Tune is unavailable in Geekbench 7 mode.
+4. Open **Manual Tune** to set:
+	- **CPU Power Limits**: PL1, PL2, and PL4. Device values load as the starting defaults; the **Now** value beside each field is what the device is using. **Reset to System Default** shows the values it will restore.
+	- **Fan Control**: leave Automatic selected (the EC controls the fan; the current RPM is shown) or switch to Manual and set an RPM per detected fan.
+	- **Thermal HAL JSON**: load and edit the device `thermal_info_config.json`; a backup is kept for Restore Default.
+5. Open **Stress & Auto Tune** and follow the three steps:
+	- **1 Workload**: choose **Stress Workloads** (`stressapptest` and/or WebGL Aquarium with 1 to 30,000 fish, plus a duration) or **Geekbench 7** (CPU/GPU benchmark only, `--no-upload`, no duration; telemetry continues until it completes). Before starting, TPTS closes Chrome and Settings, returns Android to its launcher, and clears background app processes. WebGL Aquarium runs Chrome in fullscreen and restores system bars when complete.
+	- **2 Auto Tune Limits** (optional): temperature limits, SoC averaging period, PL1 step, minimum PL1, and recovery hold. The starting PL1 is the value set in Manual Tune and is shown here.
+	- **3 Run**: **Start Stress Test** runs the workload only so you can review thermal, power, and throttle status. **Start Auto Tune** runs the same workload, leaves fan control to the EC, lowers PL1 in steps when a limit is exceeded, and exports a Power Profile when complete; it does not edit the device thermal JSON. Auto Tune is unavailable in Geekbench 7 mode (the button is disabled and the reason is shown).
 
 ### Linux (x86_64)
 
