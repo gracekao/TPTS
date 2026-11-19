@@ -21,7 +21,7 @@ Thermal & Power Tuning System for Android device thermal management, stress test
 
 4. **Tune or Test**:
         - Use **Live Monitor** to view real-time temperature, power, fan, and selected thermal-zone metrics.
-        - Use **Manual Tune** to change CPU power limits, select automatic/manual fan control, or edit the thermal HAL JSON.
+        - Use **Manual Tune** to change CPU power limits, select automatic/manual fan control, or edit the thermal HAL JSON. Fan control follows the detected fan governor (see **Fan governor** below). **Apply & Verify** at the bottom applies the power limits, runs the workload selected on the Stress page (default `stressapptest`, 60 s) without leaving the tab, and then shows a **Run Result** (see below).
         - Use **Stress & Auto Tune**: step 1 selects the workload, step 2 sets the optional Auto Tune limits, step 3 has **Start Stress Test** (workload only) and **Start Auto Tune** (workload plus stepwise PL1 control).
         - Before a stress test, TPTS closes Chrome and Settings, returns to the Android launcher, and clears background app processes.
         - WebGL Aquarium runs Chrome in fullscreen; system bars are restored when the test completes or is stopped.
@@ -70,7 +70,9 @@ Windows fallback: if `stress_apk/` is missing, selecting the **Geekbench 7** mod
 Each **PLx Setting** row in Thermal Tune shows two values:
 
 - **Input box**: the value **Apply Power Limits** writes. It starts at the saved system default and changes only when you edit it, apply it, or Auto Tune adjusts PL1.
-- **Now: X W** (right side, also the PL1/PL2 cards): the value the device is using now, read from MSR `0x610` / `0x601` every second.
+- **Now: X W** (right side, also the PL1/PL2 cards): the value the device is enforcing now. On devices that expose `/sys/class/powercap/intel-rapl-mmio:0`, this is **min(MSR, MMIO)** because the PMC enforces the lower of the two PL1 sources (the tooltip lists both); otherwise it is the MSR `0x610` / `0x601` value read every second.
+
+**Apply Power Limits** writes PL1/PL2 to MSR `0x610`, PL4 to MSR `0x601`, and - when the nodes exist - the same watt values to `intel-rapl-mmio:0/constraint_0/1/2_power_limit_uw`. Without the MMIO write a higher PL1 would not take effect: measured on `10.225.75.41` (lapis), MSR 30 W with MMIO still 25 W throttled to 25 W (`PBM_PL1` set) after the PL1 time window, while MSR 30 W + MMIO 30 W did not. The MMIO values present at the first connection are saved next to the MSR defaults in `/data/local/tmp/tpts_power_limit_defaults` (`MMIO_PL1=`/`MMIO_PL2=`/`MMIO_PL4=`, in uW) and **Reset to System Default** restores them too. Raising PL1 only removes the cap; the thermal HAL `package-0` cooling device (if bound) still lowers the MSR PL1 when its sensors heat up, which is the intended protection.
 
 `Now: 15 W (limited)` in amber means the device is below the value TPTS last applied (or the saved default if nothing was applied), so another controller lowered it. On Android desktop devices this is usually the thermal HAL: for example, on `10.225.75.53` (lapis), `init.lapis.rc` sets PL1 to 25 W at boot, and `/vendor/etc/thermal/lapis/thermal_info_config.json` defines a `package-0` power-cap cooling device (25 W down to 13 W in 0.5 W steps) bound to virtual sensors such as `VIRTUAL-SKIN-PL1` and `VIRTUAL-TOP-SOC`. During a stress test it lowered PL1 to 15 W and restored 25 W after cool-down. The firmware MMIO limit (`intel-rapl-mmio:0`) stays at 25 W; the CPU uses the lower of the two. Results recorded in this state include the thermal HAL's throttling; to test with a fixed PL1, change the thermal configuration first.
 
@@ -87,6 +89,26 @@ Auto Tune uses `ectool autofanctrl` before it starts, so the EC remains the sole
 Auto Tune does not modify `thermal_info_config.json`. On completion it exports a power profile containing the temperature limits, SOC averaging period, EC fan mode, final PL limits, and each PL1 adjustment. Thermal HAL JSON editing remains a separate, manual workflow.
 
 Fan control is represented through thermal HAL cooling-device votes such as `CdevRequest`, `BindedCdevInfo`, and `LimitInfo`; these values are cooling-device states, not direct fan RPM values. The actual fan behavior depends on the device's thermal driver and `WritePath` mapping.
+
+### Fan governor
+
+On connect, TPTS reads both the EC view (`ectool pwmgetnumfans` / `pwmgetfanrpm`) and the thermal HAL view (`/dev/thermal/cdev-by-name/TFN*/{cur_state,max_state}`, plus how many `CdevRequest` entries in the active `thermal_info_config.json` bind a `TFN*` device). The Fan Control heading in Manual Tune shows the result:
+
+- **Thermal HAL · TFN1**: the kernel exposes the fan as an ACPI/DPTF cooling device (`acpi-fan` driver, requires `DRIVERS_INTEL_DPTF` in coreboot) and the thermal HAL owns it. Fan duty is `cur_state × (100 / max_state)` percent (`max_state` 50 means 2 % steps). **Automatic** leaves the HAL in control. TPTS disables Manual RPM when a `TFN*` cooling device exists: an external write can desynchronize the HAL's cached vote, and a later lower write cannot be proven safe from the exported state alone. Use Thermal HAL JSON to tune its automatic fan curve. TPTS reads and displays the HAL duty but does not write `cur_state`. EC-only machines retain `ectool pwmsetfanrpm` Manual RPM.
+- **EC · N fans**: no `TFN*` cooling device exists (for example `10.225.75.73` atria, whose firmware does not generate the DPTF ACPI tables, so `fan.ko` never binds). **Automatic** = `ectool autofanctrl`, **Manual RPM** = `ectool pwmsetfanrpm <rpm> <index>`.
+
+The Fan Speed card shows EC RPM per fan plus the HAL duty per `TFN*` device; CSV exports add a `<TFN>_duty_pct` column next to the RPM columns.
+
+### Run Result (Verify / Stress Test)
+
+Every stress run (from **Apply & Verify** in Manual Tune or **Start Stress Test** on the Stress page; not Auto Tune or Geekbench) records one sample per second and, when the workload finishes or is stopped, fills the **Run Result** panel in the main column with an applied-vs-observed comparison:
+
+- **PL1**: `held` when `PBM_PL1` was observed, the last-third power average was within 1.5 W of the requested limit, and no thermal event was observed. A lower MSR or MMIO value is reported without assuming which controller changed it. `too short for PL1` is a heuristic for runs under 45 s; the actual time window depends on the device configuration.
+- **PL2**: how many samples asserted `PBM_PL2` and the burst peak.
+- **Temperature**: peak and the first `THERMAL`/`PROCHOT` sample.
+- **Fan**: EC manual mode compares its target with observed RPM. Thermal HAL mode reports a minimum RPM/duty floor; the HAL may request a higher state, which TPTS preserves and counts as a higher cooling request, not an override failure.
+
+The Stress page shows a `Testing with:` line (current PL1/PL2/PL4, effective PL1, fan setting) above the Run buttons, and **Download Result JSON** saves the verdict, metrics, and all samples. A lower MSR limit or a thermal event alone does not establish which controller caused it; use HAL diagnostics and traces to determine the cause.
 
 ### Active Telemetry Sources
 
@@ -112,6 +134,8 @@ Some devices reset the package energy counter every few seconds (observed on `10
 | Thermal-zone temperatures | `/sys/class/thermal/thermal_zone*/temp` and matching `type` | None; zones are shown when readable. Raw values above 1000 are converted from millidegrees C for display. | C | Optional thermal-zone cards and temperature chart |
 | CPU frequency | Effective (busy) frequency per core = TSC rate × ΔAPERF (MSR `0xE8`) / ΔMPERF (MSR `0xE7`) over each one-second sample, the same definition as PTAT `Effective Frequency (UCC/UCR)`. The TSC rate is calibrated from MSR `0x10` against uptime after 5 seconds (MSR `0xCE` ratio × 100 MHz before that). The card shows CPU0; logs also record every core. | `scaling_cur_freq` (a few-millisecond snapshot) only when MSR counters are unavailable; a core that stayed idle for the whole second is `NA`. | kHz / MHz, displayed as GHz | CPU Freq card, CSV `CPU_Freq_kHz` / `CPU_Eff_MHz_all` |
 | Fan count and RPM | `ectool pwmgetnumfans` and `ectool pwmgetfanrpm` | `/sys/class/hwmon/hwmon*/fan*_input` | RPM | Fan cards and CSV log |
+| Thermal HAL fan duty | `/dev/thermal/cdev-by-name/TFN*/cur_state` and `max_state` (sampler field `FAN_HAL`, e.g. `TFN1:25/50`) | `NA` when no TFN cooling device exists (EC governor) | cur_state, shown as % duty | Fan card, Fan Control governor, CSV `<TFN>_duty_pct` |
+| MMIO power limits | `/sys/class/powercap/intel-rapl-mmio:0/constraint_0/1/2_power_limit_uw` (sampler field `MMIO_PL_UW`, e.g. `25000000/55000000/163000000`) | `NA` when the node is absent; `Now` then shows the MSR value alone | uW, shown as W | `Now` = min(MSR, MMIO) on PL1/PL2/PL4, Apply/Reset write-back |
 | PL1 / PL2 | MSR `0x610` | Bits `[0:14]` for PL1 and `[32:46]` for PL2; each raw unit is 1/2^N W, where N is MSR `0x606` bits `[3:0]` (0.125 W on tested PTL devices). PL values are not shown or written until the unit has been read. | W | Thermal Tune defaults and applied-limit display |
 | PL4 | MSR `0x601` | Bits `[12:0]`, using the same `0x606` power unit. | W | Thermal Tune defaults and applied-limit display |
 | Thermal / PROCHOT / power-limit flags | MSR `0x1B1` (package thermal status) | Bit 0: thermal status, bit 2: PROCHOT, bit 10: power-limit status. Package scope, matching PTAT; CPU0-only `0x19C` is no longer used. | Boolean | Status lamps, Thermal Events, Auto Tune emergency guard |

@@ -24,8 +24,8 @@
         .page.active { display:block; animation:page-in .25s ease-out; }
         @keyframes page-in { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:translateY(0); } }
         .dashboard-layout { display:grid; grid-template-columns:292px minmax(0,1fr); gap:16px; max-width:1600px; margin:0 auto; }
-        .sidebar,.panel { background:var(--surface); border:1px solid var(--border); border-radius:8px; }
-        .sidebar { background:none; border:0; padding:0; align-self:start; display:grid; gap:14px; }
+        .sidebar,.panel { min-width:0; background:var(--surface); border:1px solid var(--border); border-radius:8px; }
+        .sidebar { background:none; border:0; padding:0; min-width:0; align-self:start; display:grid; grid-template-columns:minmax(0,1fr); gap:14px; }
         .sidebar-connect { padding:18px; }
         .sidebar-title,.panel-title { display:flex; align-items:center; gap:9px; margin:0; color:var(--cyan); font-size:16px; }
         .sidebar-title { padding-bottom:14px; border-bottom:1px solid var(--border); font-size:20px; }
@@ -39,7 +39,7 @@
         .monitor-tab:hover { color:#dce3f6; background:#161a2a; }
         .monitor-tab.active { z-index:1; background:var(--surface); color:#fff; box-shadow:inset 0 3px 0 var(--cyan); }
         .monitor-tab.active .tab-icon { opacity:1; }
-        .sidebar-tab-content { padding:0 18px 18px; border:1px solid var(--border); border-radius:8px; background:var(--surface); animation:page-in .22s ease-out; }
+        .sidebar-tab-content { min-width:0; overflow-wrap:anywhere; padding:0 18px 18px; border:1px solid var(--border); border-radius:8px; background:var(--surface); animation:page-in .22s ease-out; }
         .page-head { padding:14px 0 13px; border-bottom:1px solid var(--border); }
         .page-index { display:block; margin-bottom:4px; color:var(--muted); font-size:10px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }
         .page-head h3 { margin:0; color:#fff; font-size:15px; }
@@ -50,6 +50,10 @@
         .form-group { margin-bottom:13px; }
         label { display:flex; justify-content:space-between; gap:8px; margin-bottom:6px; color:var(--muted); font-size:11px; font-weight:600; }
         .current-hint { flex-shrink:0; color:var(--cyan); font-family:Consolas,monospace; font-weight:700; line-height:1.2; white-space:nowrap; }
+        #fan-count-hint { flex-shrink:1; min-width:0; overflow:hidden; text-overflow:ellipsis; font-size:11px; cursor:help; }
+        #tab-verify h4 { flex-wrap:wrap; }
+        #verify-status { flex:1 0 100%; min-width:0; white-space:normal; overflow-wrap:anywhere; font-size:11px; }
+        .fan-duty-hint { display:block; margin-top:4px; font-size:10.5px; font-weight:400; white-space:normal; color:#aeb6cd; }
         .current-hint.limited-hint { color:#ffb347; cursor:help; }
         input,select,textarea { width:100%; border:1px solid var(--border); border-radius:5px; outline:none; background:var(--deep); color:var(--text); font-family:Consolas,monospace; }
         input,select { height:36px; padding:0 10px; }
@@ -67,19 +71,19 @@
         .thermal-list { display:grid; gap:10px; }
         .check-row { display:flex; align-items:center; justify-content:flex-start; gap:9px; margin:0; color:#b8c0d5; font-size:12px; }
         .check-row input { width:14px; height:14px; accent-color:var(--cyan); }
-        .dashboard-main { display:grid; gap:16px; min-width:0; }
+        .dashboard-main { display:grid; grid-template-columns:minmax(0,1fr); gap:16px; min-width:0; }
         .panel { padding:17px; }
-        .panel-header { display:flex; align-items:center; justify-content:space-between; padding-bottom:12px; border-bottom:1px solid var(--border); }
+        .panel-header { display:flex; flex-wrap:wrap; gap:8px; align-items:center; justify-content:space-between; min-width:0; overflow-wrap:anywhere; padding-bottom:12px; border-bottom:1px solid var(--border); }
         .panel-note { color:var(--muted); font-size:11px; }
         .metrics { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:12px; margin-top:15px; }
         .metric { min-width:0; height:74px; display:grid; align-content:center; justify-items:center; border-left:4px solid var(--accent); border-radius:7px; background:var(--deep); }
         .metric[hidden], .panel[hidden], .legend-item[hidden] { display:none; }
         .metric-label { color:var(--muted); font-size:10px; white-space:nowrap; }
-        .metric-value { margin-top:7px; color:var(--accent); font-family:Consolas,monospace; font-size:clamp(16px,1.55vw,23px); white-space:nowrap; }
+        .metric-value { max-width:100%; overflow:hidden; margin-top:7px; color:var(--accent); font-family:Consolas,monospace; font-size:clamp(16px,1.55vw,23px); text-overflow:ellipsis; white-space:nowrap; }
         #v-fan { font-size:clamp(11px,.9vw,14px) !important; line-height:1.25; text-align:center; white-space:pre-line; }
         .chart-wrap { height:210px; margin-top:10px; }
         canvas { display:block; width:100%; height:100%; }
-        .legend { display:flex; justify-content:center; gap:16px; color:#bdc3d6; font-size:10px; }
+        .legend { display:flex; flex-wrap:wrap; justify-content:center; gap:8px 16px; color:#bdc3d6; font-size:10px; }
         .legend-item::before { content:""; display:inline-block; width:24px; height:9px; margin-right:5px; border:2px solid currentColor; vertical-align:-1px; }
         .legend-temp { color:var(--data-temp); } .legend-package { color:#e8ecf5; } .legend-pl1 { color:#facc15; } .legend-pl2 { color:#fb923c; } .legend-ia { color:#ec4899; } .legend-gt { color:#3ddc97; }
         #console { height:112px; margin-top:12px; padding:12px; overflow-y:auto; border:1px solid var(--border); border-radius:5px; background:var(--deep); color:#aeb6cd; font:11px/1.5 Consolas,monospace; white-space:pre-wrap; }
@@ -105,7 +109,7 @@
         .stress-workloads[hidden] { display:none; }
         .stress-mode { display:grid; grid-template-columns:1fr 1fr; gap:0; margin:0 0 12px; border:1px solid var(--border); border-radius:5px; overflow:hidden; }
         .stress-mode label { display:block; cursor:pointer; }
-        .stress-mode input { position:absolute; opacity:0 !important; pointer-events:none; }
+        .stress-mode input { position:absolute; width:1px; height:1px; padding:0; border:0; opacity:0 !important; pointer-events:none; }
         .stress-mode span { display:block; padding:8px 6px; background:var(--deep); color:var(--muted); font-size:12px; font-weight:700; text-align:center; }
         .stress-mode label + label span { border-left:1px solid var(--border); }
         .stress-mode input:checked + span { background:#291522; color:#ff9abe; }
@@ -155,7 +159,7 @@
         #tab-auto-tune .thermal-json-status { color:#b8c4dc; }
         .auto-tune-step { grid-column:1/-1; }
         .auto-tune-result { display:grid; gap:9px; margin-top:13px; }
-        .auto-tune-summary { margin:0; color:#dce3f6; font:12px/1.55 Consolas,monospace; white-space:pre-wrap; }
+        .auto-tune-summary { min-width:0; overflow-wrap:anywhere; margin:0; color:#dce3f6; font:12px/1.55 Consolas,monospace; white-space:pre-wrap; }
         .auto-tune-summary .tune-over { color:#ff6672; font-weight:700; }
         .auto-tune-summary .tune-warn { color:#ffaa00; }
         .auto-tune-summary .tune-ok { color:#18ca70; }
@@ -189,7 +193,7 @@
         #clip-help summary { cursor:pointer; color:var(--text, #c3c8d8); }
         #clip-help p { margin:4px 0; }
         @media (max-width:1050px) { .metrics { grid-template-columns:repeat(3,1fr); } .tune-grid { grid-template-columns:1fr; } .wide-panel { grid-column:auto; } .stress-controls { grid-template-columns:1fr; } .thermal-json-panel .thermal-json-actions { grid-template-columns:repeat(2,minmax(0,1fr)); } }
-        @media (max-width:760px) { .topbar { padding:10px 14px; flex-wrap:wrap; gap:8px; } .brand small,.connection-state { display:none; } .page { padding:10px; } .dashboard-layout { grid-template-columns:1fr; } .metrics { grid-template-columns:repeat(2,1fr); } .metric { height:68px; } .chart-wrap { height:190px; } .power-inputs,.fan-controls,.registers,.connect-row,.thermal-json-meta,.thermal-json-panel .thermal-json-actions,.auto-tune-inputs { grid-template-columns:1fr; } .action-row,.auto-tune-actions { flex-direction:column; } .action-row button,.auto-tune-actions button { width:100%; } }
+        @media (max-width:760px) { .topbar { padding:10px 14px; flex-wrap:wrap; gap:8px; } .brand small,.connection-state { display:none; } .page { padding:10px; } .dashboard-layout { grid-template-columns:1fr; } .metrics { grid-template-columns:repeat(2,minmax(0,1fr)); } .metric { height:68px; } .chart-wrap { height:190px; } .power-inputs,.fan-controls,.registers,.connect-row,.thermal-json-meta,.thermal-json-panel .thermal-json-actions,.auto-tune-inputs { grid-template-columns:1fr; } .action-row,.auto-tune-actions { flex-direction:column; } .action-row button,.auto-tune-actions button { width:100%; } }
     </style>
 </head>
 <body>
@@ -276,6 +280,12 @@
                         <div class="fan-rpm-rows" id="fan-rpm-rows" hidden></div>
                         <div class="action-row"><button class="primary-button" onclick="applyFanSettings()">Apply Fan Settings</button></div>
                     </div>
+                    <div class="section" id="tab-verify">
+                        <h4>✔ Verify <span class="current-hint" id="verify-status" style="margin-left:auto">--</span></h4>
+                        <p class="section-sub">Applies the power limits above, runs the workload selected on the Stress page, then shows a <b>Run Result</b> comparing applied vs. observed values. PL1 only engages after its ~30–45 s time window, so keep at least 60 s. Thermal HAL Manual RPM is a minimum fan floor; HAL can always request more cooling.</p>
+                        <div class="form-group"><label for="verify-duration">Duration</label><div class="unit-field"><input type="number" id="verify-duration" value="60" min="30" max="3600"><span class="unit">sec</span></div></div>
+                        <div class="action-row"><button class="success-button" id="verify-start-button" onclick="applyAndVerify()">Apply &amp; Verify</button></div>
+                    </div>
                     <div class="section" id="tab-thermal-json">
                         <h4>🧩 Thermal HAL JSON</h4>
                         <p class="section-sub">View or edit <code>thermal_info_config.json</code> on the device. A backup is kept for Restore Default.</p>
@@ -329,6 +339,7 @@
                     </div>
                     <div class="section" id="tab-run">
                         <h4><span class="step-badge">3</span> Run</h4>
+                        <p class="section-sub" id="run-settings-snapshot">Testing with: --</p>
                         <div class="run-option">
                             <button class="primary-button" id="stress-start-button" onclick="startThermalPipeline()">Start Stress Test</button>
                             <p class="run-caption" id="stress-run-caption">Runs the workload only. Watch temperature, power, and throttle status.</p>
@@ -392,8 +403,8 @@
                     </div>
                 </div>
                 <div class="panel" id="auto-tune-result" hidden>
-                    <div class="panel-header"><h3 class="panel-title">⚙ Auto Tune Result</h3><span class="panel-note" id="auto-tune-result-state">Dry run</span></div>
-                    <div class="auto-tune-result"><pre class="auto-tune-summary" id="auto-tune-summary"></pre><div class="auto-tune-actions"><button class="secondary-button" onclick="exportAutoTuneProfile()">Download Power Profile</button></div></div>
+                    <div class="panel-header"><h3 class="panel-title" id="auto-tune-result-title">⚙ Run Result</h3><span class="panel-note" id="auto-tune-result-state">Dry run</span></div>
+                    <div class="auto-tune-result"><pre class="auto-tune-summary" id="auto-tune-summary"></pre><div class="auto-tune-actions"><button class="secondary-button" id="auto-tune-download" onclick="exportAutoTuneProfile()">Download Result JSON</button></div></div>
                 </div>
                 <div class="panel"><div class="panel-header"><h3 class="panel-title">› System Log</h3><button class="copy-log-btn" onclick="copyLog(this)" title="Copy Log">⧉ Copy</button></div><div id="console"></div></div>
             </section>

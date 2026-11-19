@@ -15,7 +15,9 @@ const shouldAutoLocalMode = isAndroidRuntime || isFileMode;
 let hasAutoConnectedLocal = false;
 
 let isDeviceConnected = false;
-let isPipelineRunning = false; 
+let isPipelineRunning = false;
+// The backend runs pipelines one at a time; end signals before this run's start line belong to the previous run.
+let pipelineAwaitingStart = false;
 let connectedDeviceTarget = '';
 let pendingDeviceConnect = null;
 let connectionTimeout = null;
@@ -42,6 +44,16 @@ let detectedFanRpms = [];
 let detectedFanDuty = [];
 const fanDutyUserEdited = new Set();
 let fanControlRenderedCount = -1;
+// Thermal HAL fan cooling devices (/dev/thermal/cdev-by-name/TFN*): [{ name, cur, max }].
+let halFanDevices = [];
+// Number of CdevRequest bindings to TFN* in the active thermal_info_config.json (null = unknown).
+let halFanBoundSensors = null;
+let fanModeOptionsGovernor = null;
+// ACPI _FPS reference table per TFN device: [{ pct, rpm }] (coreboot fan_perf, often generic).
+const halFanFpsTable = {};
+// Measured duty% -> RPM points per TFN device, learned from steady-state samples.
+const halFanCalibration = {};
+const halFanCurHistory = {};
 let latestSocTemp = null;
 let latestTcc = 0;
 let latestProchot = 0;
@@ -265,6 +277,11 @@ function exportTelemetryLog() {
     if (fanMetricIndex >= 0) {
         const maxFans = telemetryLog.reduce((max, row) => Math.max(max, row.fans?.length || 0), 0);
         const fanColumns = Array.from({ length: maxFans }, (_, index) => ({ header: `fan${index}_rpm`, value: (row) => row.fans?.[index] }));
+        const maxHalFans = telemetryLog.reduce((max, row) => Math.max(max, row.fanHalDuty?.length || 0), 0);
+        const halNames = halFanDevices.map((device) => device.name);
+        for (let index = 0; index < maxHalFans; index++) {
+            fanColumns.push({ header: `${halNames[index] || `tfn${index}`}_duty_pct`, value: (row) => row.fanHalDuty?.[index] });
+        }
         selectedMetrics.splice(fanMetricIndex, 1, ...fanColumns);
     }
     const header = ['sample', 'elapsed_s', 'timestamp', ...selectedMetrics.map((metric) => metric.header)];
@@ -373,17 +390,142 @@ function renderThermalZoneMetric(zoneIndex, zoneType, rawTemperature) {
     updateThermalZoneChart(metricKey, temperature);
 }
 
+// 'thermal-hal' when the kernel exposes a TFN* cooling device (the HAL owns the fan), else 'ec' or 'none'.
+function fanGovernor() {
+    if (halFanDevices.length > 0) return 'thermal-hal';
+    return detectedFanCount > 0 ? 'ec' : 'none';
+}
+
+function halFanStepPercent(device) {
+    return device && device.max > 0 ? 100 / device.max : null;
+}
+
+function halFanDutyPercent(device) {
+    const step = halFanStepPercent(device);
+    return step !== null && Number.isFinite(device.cur) ? Math.round(device.cur * step) : null;
+}
+
+// Duty->RPM curve: measured points override the _FPS reference within +/-5 % duty; (0,0) is implicit.
+function halFanCurve(device) {
+    const points = [{ pct: 0, rpm: 0 }];
+    (halFanFpsTable[device.name] || []).forEach((point) => { if (point.pct > 0) points.push({ ...point }); });
+    const measured = halFanCalibration[device.name];
+    if (measured) {
+        for (const [pct, rpm] of measured) {
+            for (let index = points.length - 1; index > 0; index--) {
+                if (Math.abs(points[index].pct - pct) <= 5) points.splice(index, 1);
+            }
+            points.push({ pct, rpm });
+        }
+    }
+    points.sort((a, b) => a.pct - b.pct);
+    return points;
+}
+
+function halFanRpmToDuty(device, rpm) {
+    if (!(rpm > 0)) return 0;
+    const points = halFanCurve(device);
+    if (points.length < 2) return Math.min(100, Math.round(rpm / 60));
+    for (let index = 1; index < points.length; index++) {
+        const a = points[index - 1];
+        const b = points[index];
+        if (rpm <= b.rpm) return Math.min(100, Math.max(0, a.pct + (rpm - a.rpm) / Math.max(1, b.rpm - a.rpm) * (b.pct - a.pct)));
+    }
+    const a = points[points.length - 2];
+    const b = points[points.length - 1];
+    const slope = (b.pct - a.pct) / Math.max(1, b.rpm - a.rpm);
+    return Math.min(100, b.pct + (rpm - b.rpm) * slope);
+}
+
+function halFanDutyToRpm(device, pct) {
+    const points = halFanCurve(device);
+    if (points.length < 2) return Math.round(pct * 60);
+    for (let index = 1; index < points.length; index++) {
+        const a = points[index - 1];
+        const b = points[index];
+        if (pct <= b.pct) return Math.round(a.rpm + (pct - a.pct) / Math.max(1, b.pct - a.pct) * (b.rpm - a.rpm));
+    }
+    const a = points[points.length - 2];
+    const b = points[points.length - 1];
+    return Math.round(b.rpm + (pct - b.pct) * (b.rpm - a.rpm) / Math.max(1, b.pct - a.pct));
+}
+
+// Learn the real duty->RPM curve: a point is kept once cur_state held for 3 samples (fan spun up).
+function updateHalFanCalibration() {
+    halFanDevices.forEach((device, index) => {
+        const rpm = detectedFanRpms[index];
+        const history = halFanCurHistory[device.name] || (halFanCurHistory[device.name] = []);
+        history.push(device.cur);
+        if (history.length > 3) history.shift();
+        const duty = halFanDutyPercent(device);
+        if (history.length === 3 && history.every((value) => value === device.cur) && duty > 0 && Number.isFinite(rpm) && rpm > 0) {
+            (halFanCalibration[device.name] || (halFanCalibration[device.name] = new Map())).set(duty, rpm);
+        }
+    });
+    updateHalFanInputHints();
+}
+
+function halFanTargetFromRpm(device, rpm) {
+    const duty = halFanRpmToDuty(device, rpm);
+    const step = halFanStepPercent(device) || 1;
+    const state = Math.max(0, Math.min(device.max, Math.round(duty / step)));
+    const maxRpm = halFanDutyToRpm(device, 100);
+    return { state, duty: Math.round(state * step), capped: rpm > maxRpm * 1.02, maxRpm };
+}
+
+function updateHalFanInputHints() {
+    document.querySelectorAll('#fan-rpm-rows input[data-hal-cdev]').forEach((input) => {
+        const device = halFanDevices.find((item) => item.name === input.dataset.halCdev);
+        const hint = input.parentElement?.querySelector('.fan-duty-hint');
+        if (!device || !hint) return;
+        const rpm = parseFloat(input.value);
+        if (!Number.isFinite(rpm) || rpm < 0) { hint.textContent = ''; hint.classList.remove('limited-hint'); return; }
+        const target = halFanTargetFromRpm(device, rpm);
+        const measured = halFanCalibration[device.name]?.size || 0;
+        hint.classList.toggle('limited-hint', target.capped);
+        hint.textContent = target.capped
+            ? `Above the fan maximum (\u2248 ${target.maxRpm} RPM at 100% duty); will be capped at 100% (cur_state ${device.max}/${device.max}).`
+            : `\u2248 ${target.duty}% duty (cur_state ${target.state}/${device.max})${measured ? '' : ', from ACPI _FPS table'}`;
+    });
+}
+
+// Parses "TFN1:25/50,TFN2:0/50" (or NA) from the sampler / inventory output.
+function applyHalFanReport(text) {
+    const devices = [];
+    if (text && text !== 'NA') {
+        for (const part of text.split(',')) {
+            const match = part.match(/^([A-Za-z0-9_-]+):(\d+)\/(\d+)$/);
+            if (match) devices.push({ name: match[1], cur: parseInt(match[2], 10), max: parseInt(match[3], 10) });
+        }
+    }
+    const previousGovernor = fanGovernor();
+    const namesChanged = devices.length !== halFanDevices.length || devices.some((device, index) => device.name !== halFanDevices[index]?.name || device.max !== halFanDevices[index]?.max);
+    halFanDevices = devices;
+    if (namesChanged || previousGovernor !== fanGovernor()) {
+        fanControlRenderedCount = -1;
+        syncFanControlInputs();
+    }
+    renderFanSpeeds();
+}
+
 function renderFanSpeeds() {
     const fanEl = document.getElementById('v-fan');
     if (!fanEl) return;
-    if (detectedFanCount <= 0) {
+    if (detectedFanCount <= 0 && halFanDevices.length === 0) {
         fanEl.innerText = 'No Fan';
         fanEl.title = '';
         return;
     }
     const fanRpms = Array.from({ length: detectedFanCount }, (_, index) => detectedFanRpms[index] ?? null);
-    fanEl.innerText = fanRpms.map((rpm, index) => `F${index + 1}: ${rpm ?? '--'}`).join('\n');
-    fanEl.title = fanRpms.map((rpm, index) => `Fan ${index}: ${rpm ?? '--'} RPM`).join('\n');
+    const lines = fanRpms.map((rpm, index) => `F${index + 1}: ${rpm ?? '--'}`);
+    const titles = fanRpms.map((rpm, index) => `Fan ${index}: ${rpm ?? '--'} RPM`);
+    halFanDevices.forEach((device) => {
+        const duty = halFanDutyPercent(device);
+        lines.push(`${device.name}: ${duty ?? '--'}%`);
+        titles.push(`Thermal HAL ${device.name}: cur_state ${device.cur}/${device.max} = ${duty ?? '--'}% duty`);
+    });
+    fanEl.innerText = lines.join('\n');
+    fanEl.title = titles.join('\n');
     syncFanControlInputs();
     renderFanAutoHint();
 }
@@ -529,17 +671,64 @@ function powerLimitStep() {
 
 // Last PL values written by Apply Power Limits / Auto Tune; null means the device should be at its saved default.
 let appliedPowerLimits = null;
+// Firmware-side limits on intel-rapl-mmio:0 (W, null when the node is absent); the PMC enforces min(MSR, MMIO).
+const latestMmioLimits = { pl1: null, pl2: null, pl4: null };
+const latestMsrLimits = { pl1: null, pl2: null, pl4: null };
+// MMIO defaults (uW strings) saved on the device next to the MSR defaults; restored by Reset.
+const tuningDefaultMmio = { pl1: null, pl2: null, pl4: null };
+const MMIO_RAPL_DIR = '/sys/class/powercap/intel-rapl-mmio:0';
 
-function renderPowerLimitHint(id, key, watts) {
+function parseMmioLimitsField(text) {
+    if (!text || text === 'NA') {
+        latestMmioLimits.pl1 = latestMmioLimits.pl2 = latestMmioLimits.pl4 = null;
+        return;
+    }
+    const parts = text.split('/');
+    ['pl1', 'pl2', 'pl4'].forEach((key, index) => {
+        latestMmioLimits[key] = /^\d+$/.test(parts[index] || '') ? parseInt(parts[index], 10) / 1e6 : null;
+    });
+}
+
+function mmioWriteCommands(pl1, pl2, pl4) {
+    return [['constraint_0', pl1], ['constraint_1', pl2], ['constraint_2', pl4]]
+        .filter(([, watts]) => Number.isFinite(watts) && watts > 0)
+        .map(([constraint, watts]) => `[ -e ${MMIO_RAPL_DIR}/${constraint}_power_limit_uw ] && echo ${Math.round(watts * 1e6)} > ${MMIO_RAPL_DIR}/${constraint}_power_limit_uw`)
+        .join('; ');
+}
+
+const MMIO_ECHO_COMMAND = `m=; for c in 0 1 2; do v=$(cat ${MMIO_RAPL_DIR}/constraint_\${c}_power_limit_uw 2>/dev/null); m="\${m:+\$m/}\${v:-NA}"; done; echo MMIO_PL_UW: $m`;
+
+function renderPowerLimitHint(id, key, msrWatts) {
     const el = document.getElementById(id);
     if (!el) return;
+    latestMsrLimits[key] = msrWatts;
+    const mmio = latestMmioLimits[key];
+    const watts = Number.isFinite(mmio) ? Math.min(msrWatts, mmio) : msrWatts;
     const reference = appliedPowerLimits?.[key] ?? tuningDefaults[key];
     const limited = Number.isFinite(reference) && watts < reference - 0.01;
     el.innerText = `Now: ${formatPowerWatts(watts)} W${limited ? ' (limited)' : ''}`;
     el.classList.toggle('limited-hint', limited);
-    el.title = limited
-        ? `The device is using ${formatPowerWatts(watts)} W, below the ${formatPowerWatts(reference)} W that TPTS applied or saved as the system default. Another controller lowered it, usually the Android thermal HAL power-cap cooling device. See TPTS.md, "Power limit setting vs Now".`
+    const sources = Number.isFinite(mmio)
+        ? `Effective = min(MSR ${formatPowerWatts(msrWatts)} W, MMIO ${formatPowerWatts(mmio)} W); the PMC enforces the lower one.`
         : 'Value the device is using now (MSR 0x610 / 0x601).';
+    el.title = limited
+        ? `The device is using ${formatPowerWatts(watts)} W, below the ${formatPowerWatts(reference)} W that TPTS applied or saved as the system default. Another controller lowered it, usually the Android thermal HAL power-cap cooling device. ${sources} See TPTS.md, "Power limit setting vs Now".`
+        : sources;
+    return watts;
+}
+
+function rerenderPowerLimitHints() {
+    if (Number.isFinite(latestMsrLimits.pl1)) {
+        latestPl1 = renderPowerLimitHint('v-pl1', 'pl1', latestMsrLimits.pl1);
+        const card = document.getElementById('v-pl1-live');
+        if (card) card.innerText = `${formatPowerWatts(latestPl1)} W`;
+    }
+    if (Number.isFinite(latestMsrLimits.pl2)) {
+        latestPl2 = renderPowerLimitHint('v-pl2', 'pl2', latestMsrLimits.pl2);
+        const card = document.getElementById('v-pl2-live');
+        if (card) card.innerText = `${formatPowerWatts(latestPl2)} W`;
+    }
+    if (Number.isFinite(latestMsrLimits.pl4)) renderPowerLimitHint('v-pl4', 'pl4', latestMsrLimits.pl4);
 }
 
 function decodeAndRenderPLFrom610(hex610) {
@@ -556,16 +745,14 @@ function decodeAndRenderPLFrom610(hex610) {
     let pl2_watts = pl2_raw * msrPowerUnitWatts;
 
     const v610 = document.getElementById('v610');
-    const pl1Text = formatPowerWatts(pl1_watts);
-    const pl2Text = formatPowerWatts(pl2_watts);
-    renderPowerLimitHint('v-pl1', 'pl1', pl1_watts);
-    renderPowerLimitHint('v-pl2', 'pl2', pl2_watts);
-    latestPl1 = pl1_watts;
-    latestPl2 = pl2_watts;
+    const pl1Effective = renderPowerLimitHint('v-pl1', 'pl1', pl1_watts);
+    const pl2Effective = renderPowerLimitHint('v-pl2', 'pl2', pl2_watts);
+    latestPl1 = pl1Effective;
+    latestPl2 = pl2Effective;
     const pl1Card = document.getElementById('v-pl1-live');
     const pl2Card = document.getElementById('v-pl2-live');
-    if (pl1Card) pl1Card.innerText = `${pl1Text} W`;
-    if (pl2Card) pl2Card.innerText = `${pl2Text} W`;
+    if (pl1Card) pl1Card.innerText = `${formatPowerWatts(pl1Effective)} W`;
+    if (pl2Card) pl2Card.innerText = `${formatPowerWatts(pl2Effective)} W`;
     if (v610) v610.innerText = hex610;
 
 }
@@ -873,7 +1060,7 @@ function requestTuningDefaults(force = false) {
     if (!ipInput) return;
     const target = normalizeTarget(ipInput.value);
     if (!target) return;
-    const command = "su 0 sh -c 'v610=$(/data/local/tmp/iotools rdmsr 0 0x610 2>/dev/null); [ -z \"$v610\" ] && v610=$(/data/local/tmp/iotools rdmsr 0x610 2>/dev/null); v601=$(/data/local/tmp/iotools rdmsr 0 0x601 2>/dev/null); [ -z \"$v601\" ] && v601=$(/data/local/tmp/iotools rdmsr 0x601 2>/dev/null); defaults=/data/local/tmp/tpts_power_limit_defaults; created=0; case \"$v610\" in 0x[0-9A-Fa-f]*) valid610=1;; *) valid610=0;; esac; case \"$v601\" in 0x[0-9A-Fa-f]*) valid601=1;; *) valid601=0;; esac; if [ \"$valid610\" = 1 ] && [ \"$valid601\" = 1 ] && { [ ! -s \"$defaults\" ] || ! grep -q \"^MSR_610=0x[0-9A-Fa-f]\" \"$defaults\" || ! grep -q \"^MSR_601=0x[0-9A-Fa-f]\" \"$defaults\"; }; then printf \"MSR_610=%s\\nMSR_601=%s\\n\" \"$v610\" \"$v601\" > \"$defaults\"; created=1; fi; d610=$(sed -n \"s/^MSR_610=//p\" \"$defaults\" | head -n 1); d601=$(sed -n \"s/^MSR_601=//p\" \"$defaults\" | head -n 1); echo TPTS_TUNING_SYNC_BEGIN; echo MSR_606: $(/data/local/tmp/iotools rdmsr 0 0x606 2>/dev/null); echo MSR_1A2: $(/data/local/tmp/iotools rdmsr 0 0x1A2 2>/dev/null); echo MSR_610: ${v610:-NA}; echo MSR_601: ${v601:-NA}; echo TPTS_DEFAULT_610: ${d610:-NA}; echo TPTS_DEFAULT_601: ${d601:-NA}; echo TPTS_DEFAULTS_CREATED: $created; echo TPTS_TUNING_SYNC_END'";
+    const command = "su 0 sh -c 'v610=$(/data/local/tmp/iotools rdmsr 0 0x610 2>/dev/null); [ -z \"$v610\" ] && v610=$(/data/local/tmp/iotools rdmsr 0x610 2>/dev/null); v601=$(/data/local/tmp/iotools rdmsr 0 0x601 2>/dev/null); [ -z \"$v601\" ] && v601=$(/data/local/tmp/iotools rdmsr 0x601 2>/dev/null); defaults=/data/local/tmp/tpts_power_limit_defaults; created=0; case \"$v610\" in 0x[0-9A-Fa-f]*) valid610=1;; *) valid610=0;; esac; case \"$v601\" in 0x[0-9A-Fa-f]*) valid601=1;; *) valid601=0;; esac; if [ \"$valid610\" = 1 ] && [ \"$valid601\" = 1 ] && { [ ! -s \"$defaults\" ] || ! grep -q \"^MSR_610=0x[0-9A-Fa-f]\" \"$defaults\" || ! grep -q \"^MSR_601=0x[0-9A-Fa-f]\" \"$defaults\"; }; then printf \"MSR_610=%s\\nMSR_601=%s\\n\" \"$v610\" \"$v601\" > \"$defaults\"; created=1; fi; d610=$(sed -n \"s/^MSR_610=//p\" \"$defaults\" | head -n 1); d601=$(sed -n \"s/^MSR_601=//p\" \"$defaults\" | head -n 1); M=/sys/class/powercap/intel-rapl-mmio:0; m0=$(cat $M/constraint_0_power_limit_uw 2>/dev/null); m1=$(cat $M/constraint_1_power_limit_uw 2>/dev/null); m2=$(cat $M/constraint_2_power_limit_uw 2>/dev/null); if [ -n \"$m0\" ] && [ -s \"$defaults\" ] && ! grep -q \"^MMIO_PL1=\" \"$defaults\"; then printf \"MMIO_PL1=%s\\nMMIO_PL2=%s\\nMMIO_PL4=%s\\n\" \"$m0\" \"${m1:-NA}\" \"${m2:-NA}\" >> \"$defaults\"; fi; dm0=$(sed -n \"s/^MMIO_PL1=//p\" \"$defaults\" | head -n 1); dm1=$(sed -n \"s/^MMIO_PL2=//p\" \"$defaults\" | head -n 1); dm2=$(sed -n \"s/^MMIO_PL4=//p\" \"$defaults\" | head -n 1); echo TPTS_TUNING_SYNC_BEGIN; echo MSR_606: $(/data/local/tmp/iotools rdmsr 0 0x606 2>/dev/null); echo MSR_1A2: $(/data/local/tmp/iotools rdmsr 0 0x1A2 2>/dev/null); echo MSR_610: ${v610:-NA}; echo MSR_601: ${v601:-NA}; echo TPTS_DEFAULT_610: ${d610:-NA}; echo TPTS_DEFAULT_601: ${d601:-NA}; echo TPTS_DEFAULTS_CREATED: $created; echo MMIO_PL_UW: ${m0:-NA}/${m1:-NA}/${m2:-NA}; echo TPTS_DEFAULT_MMIO: ${dm0:-NA}/${dm1:-NA}/${dm2:-NA}; echo TPTS_TUNING_SYNC_END'";
     if (isLocalTarget(target)) {
         sendAdb(['shell', command]);
     } else {
@@ -896,6 +1083,9 @@ function resetTuningDefaultSyncState() {
     tuningDefaults.pl4 = null;
     tuningDefaultRegisters.msr610 = null;
     tuningDefaultRegisters.msr601 = null;
+    tuningDefaultMmio.pl1 = tuningDefaultMmio.pl2 = tuningDefaultMmio.pl4 = null;
+    latestMmioLimits.pl1 = latestMmioLimits.pl2 = latestMmioLimits.pl4 = null;
+    latestMsrLimits.pl1 = latestMsrLimits.pl2 = latestMsrLimits.pl4 = null;
     appliedPowerLimits = null;
     ['tune-pl1', 'tune-pl2', 'tune-pl4'].forEach((id) => {
         const el = document.getElementById(id);
@@ -903,11 +1093,44 @@ function resetTuningDefaultSyncState() {
     });
 }
 
+function updateFanModeOptions() {
+    const modeEl = document.getElementById('tune-fan-mode');
+    if (!modeEl) return;
+    const governor = fanGovernor();
+    const autoOption = modeEl.querySelector('option[value="auto"]');
+    const manualOption = modeEl.querySelector('option[value="manual"]');
+    if (governor !== fanModeOptionsGovernor) {
+        fanModeOptionsGovernor = governor;
+        if (autoOption) autoOption.textContent = governor === 'thermal-hal' ? 'Automatic (Thermal HAL)' : 'Automatic (EC autofanctrl)';
+        if (manualOption) manualOption.textContent = governor === 'thermal-hal' ? 'Manual RPM (unavailable; Thermal HAL owns fan)' : 'Manual RPM';
+    }
+    if (manualOption) manualOption.disabled = governor === 'thermal-hal';
+    if (governor === 'thermal-hal' && modeEl.value === 'manual') modeEl.value = 'auto';
+}
+
 function renderFanControlInputs() {
     const container = document.getElementById('fan-rpm-rows');
     if (!container) return;
+    updateFanModeOptions();
     const modeEl = document.getElementById('tune-fan-mode');
     const isManual = modeEl && modeEl.value === 'manual';
+    const governor = fanGovernor();
+    const hintEl = document.getElementById('fan-count-hint');
+
+    if (governor === 'thermal-hal') {
+        container.innerHTML = '';
+        container.hidden = true;
+        container.style.opacity = '1.0';
+        renderFanAutoHint();
+        if (hintEl) {
+            const names = halFanDevices.map((device) => device.name).join('/');
+            const bound = halFanBoundSensors === null ? '' : halFanBoundSensors > 0 ? `; ${halFanBoundSensors} HAL sensor binding(s) active` : '; no HAL sensor binds it';
+            hintEl.innerText = `Thermal HAL · ${names}`;
+            hintEl.title = `${detectedFanCount || halFanDevices.length} fan(s). Kernel exposes ${names} as a cooling device${bound}. Duty = cur_state × ${halFanStepPercent(halFanDevices[0]) || '?'}%.`;
+        }
+        return;
+    }
+
     const count = detectedFanCount > 0 ? detectedFanCount : 1;
 
     const existing = {};
@@ -938,8 +1161,10 @@ function renderFanControlInputs() {
     container.style.opacity = '1.0';
     renderFanAutoHint();
 
-    const hintEl = document.getElementById('fan-count-hint');
-    if (hintEl) hintEl.innerText = detectedFanCount > 0 ? `${detectedFanCount} fan${detectedFanCount === 1 ? '' : 's'} detected` : 'no fan detected';
+    if (hintEl) {
+        hintEl.innerText = detectedFanCount > 0 ? `EC · ${detectedFanCount} fan${detectedFanCount === 1 ? '' : 's'}` : 'no fan detected';
+        hintEl.title = detectedFanCount > 0 ? 'No TFN* cooling device: the EC owns the fan (ectool).' : '';
+    }
 }
 
 function renderFanAutoHint() {
@@ -949,9 +1174,13 @@ function renderFanAutoHint() {
     autoHint.hidden = isManual;
     if (isManual) return;
     const liveRpms = detectedFanRpms.slice(0, detectedFanCount).filter((rpm) => Number.isFinite(rpm));
-    autoHint.innerText = liveRpms.length
-        ? `The EC controls fan speed (now ${liveRpms.join(' / ')} RPM). Switch to Manual RPM to set a fixed speed.`
-        : 'The EC controls fan speed. Switch to Manual RPM to set a fixed speed.';
+    const rpmText = liveRpms.length ? ` (now ${liveRpms.join(' / ')} RPM)` : '';
+    if (fanGovernor() === 'thermal-hal') {
+        const duty = halFanDevices.map((device) => `${device.name} ${halFanDutyPercent(device) ?? '--'}%`).join(', ');
+        autoHint.innerText = `Thermal HAL controls ${duty}${rpmText}. Direct RPM writes are disabled to preserve HAL thermal protection; tune the fan curve in Thermal HAL JSON.`;
+        return;
+    }
+    autoHint.innerText = `The EC controls fan speed${rpmText}. Switch to Manual RPM to set a fixed speed.`;
 }
 
 function syncFanControlInputs() {
@@ -960,10 +1189,13 @@ function syncFanControlInputs() {
     renderFanControlInputs();
 }
 
+// Fan inventory: EC view (ectool) plus the Thermal HAL view (TFN* cooling devices and how many
+// sensors in the active thermal_info_config.json bind them).
 function requestFanInventory(target) {
     const resolved = normalizeTarget(target || (document.getElementById('ip') ? document.getElementById('ip').value : ''));
     if (!resolved) return;
-    const cmd = "su 0 sh -c 'echo TPTS_FAN_BEGIN; ectool pwmgetnumfans 2>&1; ectool pwmgetfanrpm 2>&1; echo TPTS_FAN_END'";
+    const halProbe = 'h=; for d in /dev/thermal/cdev-by-name/TFN*; do [ -e "$d/cur_state" ] && h="${h:+$h,}${d##*/}:$(cat $d/cur_state)/$(cat $d/max_state)"; done; echo "FAN_HAL: ${h:-NA}"; c=$(getprop vendor.thermal.config); [ -z "$c" ] && c=thermal_info_config.json; echo "FAN_HAL_BOUND: $(grep -c "CdevRequest.*TFN" /vendor/etc/$c 2>/dev/null)"; for d in /dev/thermal/cdev-by-name/TFN*; do [ -e "$d/cur_state" ] || continue; r=$(readlink -f $d); for a in /sys/bus/acpi/devices/*/physical_node/thermal_cooling; do [ "$(readlink -f $a 2>/dev/null)" = "$r" ] || continue; t=; for s in ${a%/physical_node/thermal_cooling}/state*; do [ -e "$s" ] && t="${t:+$t,}$(cut -d: -f1,3 $s | tr : =)"; done; echo "FAN_FPS: ${d##*/}=${t:-NA}"; done; done';
+    const cmd = `su 0 sh -c 'echo TPTS_FAN_BEGIN; ectool pwmgetnumfans 2>&1; ectool pwmgetfanrpm 2>&1; ${halProbe}; echo TPTS_FAN_END'`;
     if (isLocalTarget(resolved)) {
         sendAdb(['shell', cmd]);
     } else {
@@ -1068,6 +1300,12 @@ function resetLiveDeviceState() {
     detectedFanCount = 0;
     detectedFanRpms = [];
     detectedFanDuty = [];
+    halFanDevices = [];
+    halFanBoundSensors = null;
+    fanModeOptionsGovernor = null;
+    Object.keys(halFanFpsTable).forEach((key) => delete halFanFpsTable[key]);
+    Object.keys(halFanCalibration).forEach((key) => delete halFanCalibration[key]);
+    Object.keys(halFanCurHistory).forEach((key) => delete halFanCurHistory[key]);
     fanControlRenderedCount = -1;
     currentPowerLimitRegister = '';
     currentPowerLimit4Register = '';
@@ -1196,7 +1434,8 @@ function applyPowerLimits() {
     const msr610 = msr610Value.toString(16);
     const msr601 = ((base601 & ~pl4Mask) | (BigInt(pl4Raw) & pl4Mask)).toString(16);
 
-    const cmd = `su 0 sh -c '/data/local/tmp/iotools wrmsr 0 0x610 0x${msr610}; /data/local/tmp/iotools wrmsr 0 0x601 0x${msr601}; echo MSR_610: $(/data/local/tmp/iotools rdmsr 0 0x610); echo MSR_601: $(/data/local/tmp/iotools rdmsr 0 0x601)'`;
+    const mmioWrites = mmioWriteCommands(pl1, pl2, pl4);
+    const cmd = `su 0 sh -c '${[`/data/local/tmp/iotools wrmsr 0 0x610 0x${msr610}`, `/data/local/tmp/iotools wrmsr 0 0x601 0x${msr601}`, mmioWrites, 'echo MSR_610: $(/data/local/tmp/iotools rdmsr 0 0x610)', 'echo MSR_601: $(/data/local/tmp/iotools rdmsr 0 0x601)', MMIO_ECHO_COMMAND].filter(Boolean).join('; ')}'`;
 
     if (isLocalTarget(target)) {
         sendAdb(['shell', cmd]);
@@ -1204,9 +1443,15 @@ function applyPowerLimits() {
         sendAdb(['-s', target, 'shell', cmd]);
     }
 
+    const hasMmio = Number.isFinite(latestMmioLimits.pl1);
+    if (hasMmio) {
+        latestMmioLimits.pl1 = pl1;
+        if (Number.isFinite(latestMmioLimits.pl2)) latestMmioLimits.pl2 = pl2;
+        if (Number.isFinite(latestMmioLimits.pl4)) latestMmioLimits.pl4 = pl4;
+    }
     const consoleBox = document.getElementById('console');
     if (consoleBox) {
-        consoleBox.innerText += `[Tuning] Applied PL limits: PL1=${pl1}W, PL2=${pl2}W, PL4=${pl4}W\n`;
+        consoleBox.innerText += `[Tuning] Applied PL limits: PL1=${pl1}W, PL2=${pl2}W, PL4=${pl4}W${hasMmio ? ' (MSR 0x610/0x601 and intel-rapl-mmio:0; the PMC uses the lower of the two)' : ''}\n`;
         trimConsoleLog(consoleBox);
         consoleBox.scrollTop = consoleBox.scrollHeight;
     }
@@ -1222,6 +1467,7 @@ function applyPowerLimits() {
     if (pl1LiveEl) pl1LiveEl.innerText = `${formatPowerWatts(pl1)} W`;
     if (pl2LiveEl) pl2LiveEl.innerText = `${formatPowerWatts(pl2)} W`;
     redrawPowerChart();
+    return true;
 }
 
 function resetPowerLimitsToSystemDefault() {
@@ -1232,12 +1478,19 @@ function resetPowerLimitsToSystemDefault() {
     }
     const target = normalizeTarget(document.getElementById('ip') ? document.getElementById('ip').value : '');
     if (!target) return;
-    const command = `su 0 sh -c '/data/local/tmp/iotools wrmsr 0 0x610 ${msr610}; /data/local/tmp/iotools wrmsr 0 0x601 ${msr601}; echo MSR_610: $(/data/local/tmp/iotools rdmsr 0 0x610); echo MSR_601: $(/data/local/tmp/iotools rdmsr 0 0x601)'`;
+    const mmioRestore = [['constraint_0', tuningDefaultMmio.pl1], ['constraint_1', tuningDefaultMmio.pl2], ['constraint_2', tuningDefaultMmio.pl4]]
+        .filter(([, uw]) => /^\d+$/.test(uw || ''))
+        .map(([constraint, uw]) => `[ -e ${MMIO_RAPL_DIR}/${constraint}_power_limit_uw ] && echo ${uw} > ${MMIO_RAPL_DIR}/${constraint}_power_limit_uw`)
+        .join('; ');
+    const command = `su 0 sh -c '${[`/data/local/tmp/iotools wrmsr 0 0x610 ${msr610}`, `/data/local/tmp/iotools wrmsr 0 0x601 ${msr601}`, mmioRestore, 'echo MSR_610: $(/data/local/tmp/iotools rdmsr 0 0x610)', 'echo MSR_601: $(/data/local/tmp/iotools rdmsr 0 0x601)', MMIO_ECHO_COMMAND].filter(Boolean).join('; ')}'`;
     if (isLocalTarget(target)) {
         sendAdb(['shell', command]);
     } else {
         sendAdb(['-s', target, 'shell', command]);
     }
+    ['pl1', 'pl2', 'pl4'].forEach((key) => {
+        if (/^\d+$/.test(tuningDefaultMmio[key] || '') && Number.isFinite(latestMmioLimits[key])) latestMmioLimits[key] = parseInt(tuningDefaultMmio[key], 10) / 1e6;
+    });
     currentPowerLimitRegister = msr610;
     currentPowerLimit4Register = msr601;
     appliedPowerLimits = null;
@@ -1268,8 +1521,18 @@ function applyFanSettings() {
     const mode = modeEl.value;
     let cmd = '';
     let summary = '';
+    const governor = fanGovernor();
+    const halManualFile = '/data/local/tmp/tpts_fan_manual';
 
-    if (mode === 'manual') {
+    if (governor === 'thermal-hal' && mode === 'manual') {
+        alert('Manual RPM is unavailable while Thermal HAL owns this fan. Edit the Thermal HAL fan curve instead.');
+        modeEl.value = 'auto';
+        renderFanControlInputs();
+        return;
+    } else if (governor === 'thermal-hal') {
+        cmd = `su 0 sh -c 'rm -f ${halManualFile}; echo FAN_SET_DONE'`;
+        summary = 'auto (Thermal HAL retains all fan control; no direct cdev write)';
+    } else if (mode === 'manual') {
         const inputs = [...document.querySelectorAll('#fan-rpm-rows input[data-fan-idx]')];
         if (inputs.length === 0) {
             alert("No fan detected. Connect device or start monitoring first.");
@@ -1314,12 +1577,18 @@ function applyFanSettings() {
     // Fan needs ~1-2s to spin up to the target; read back after a delay so RPM isn't reported as 0.
     appendConsole('[Tuning] Reading fan RPM back in 2s (spin-up)...');
     setTimeout(() => {
-        sendShell("su 0 sh -c 'echo TPTS_FAN_BEGIN; ectool pwmgetfanrpm 2>&1; ectool temps all 2>&1; echo TPTS_FAN_END'");
+        if (governor === 'thermal-hal') {
+            requestFanInventory(target);
+        } else {
+            sendShell("su 0 sh -c 'echo TPTS_FAN_BEGIN; ectool pwmgetfanrpm 2>&1; ectool temps all 2>&1; echo TPTS_FAN_END'");
+        }
     }, 2000);
 }
 
 function renderPipelineCountdown() {
     const countdownEl = document.getElementById('pipeline-countdown');
+    const verifyEl = document.getElementById('verify-status');
+    if (verifyEl && verifyRun) verifyEl.innerText = pipelineCountdownRemaining > 0 ? `running \u00b7 ${pipelineCountdownRemaining}s left` : 'finalizing...';
     if (!countdownEl) return;
     if (pipelineCountdownRemaining <= 0) {
         countdownEl.innerText = 'Countdown: --';
@@ -1328,6 +1597,203 @@ function renderPipelineCountdown() {
     }
     countdownEl.innerText = `${pipelineCountdownLabel}: ${pipelineCountdownRemaining}s`;
     countdownEl.style.color = '#00ffcc';
+}
+
+// ---- Verification run: compares what Manual Tune applied with what the device actually did ----
+let verifyRun = null;
+
+function describeFanSetting() {
+    const mode = document.getElementById('tune-fan-mode')?.value || 'auto';
+    const governor = fanGovernor();
+    if (mode !== 'manual') return { mode: 'auto', governor, text: governor === 'thermal-hal' ? 'Automatic (Thermal HAL)' : governor === 'ec' ? 'Automatic (EC)' : 'Automatic' };
+    if (governor === 'thermal-hal') {
+        const targets = halFanDevices.map((device) => {
+            const input = document.querySelector(`#fan-rpm-rows input[data-hal-cdev="${device.name}"]`);
+            const rpm = parseFloat(input?.value);
+            const target = Number.isFinite(rpm) ? halFanTargetFromRpm(device, rpm) : null;
+            return { name: device.name, rpm: Number.isFinite(rpm) ? rpm : null, state: target?.state ?? null, duty: target?.duty ?? null, max: device.max };
+        });
+        return { mode: 'manual', governor, targets, text: `Manual ${targets.map((t) => `${t.rpm ?? '--'} RPM (${t.name} \u2248 ${t.duty ?? '--'}%)`).join(', ')}` };
+    }
+    const rpms = [...document.querySelectorAll('#fan-rpm-rows input[data-fan-idx]')].map((input) => parseFloat(input.value)).filter(Number.isFinite);
+    return { mode: 'manual', governor, targets: rpms.map((rpm, index) => ({ name: `F${index + 1}`, rpm })), text: `Manual ${rpms.join(' / ')} RPM (EC)` };
+}
+
+function renderRunSettingsSnapshot() {
+    const el = document.getElementById('run-settings-snapshot');
+    if (!el) return;
+    const pl = ['tune-pl1', 'tune-pl2', 'tune-pl4'].map((id) => document.getElementById(id)?.value || '--');
+    const effective = Number.isFinite(latestPl1) ? ` (effective PL1 now ${formatPowerWatts(latestPl1)} W)` : '';
+    el.innerText = `Testing with: PL1 ${pl[0]} / PL2 ${pl[1]} / PL4 ${pl[2]} W${effective} \u00b7 Fan: ${describeFanSetting().text}`;
+}
+
+function beginVerifyRun(workloads, durationSeconds, source) {
+    verifyRun = {
+        source,
+        startedAt: Date.now(),
+        duration: durationSeconds,
+        workloads,
+        applied: {
+            pl1: Number(document.getElementById('tune-pl1')?.value),
+            pl2: Number(document.getElementById('tune-pl2')?.value),
+            pl4: Number(document.getElementById('tune-pl4')?.value),
+            mmioPl1: latestMmioLimits.pl1,
+            fan: describeFanSetting()
+        },
+        samples: []
+    };
+    const verifyEl = document.getElementById('verify-status');
+    if (verifyEl) verifyEl.innerText = 'starting...';
+}
+
+function recordVerifySample() {
+    if (!verifyRun) return;
+    verifyRun.samples.push({
+        t: Math.round((Date.now() - verifyRun.startedAt) / 1000),
+        pkg: latestPackagePower,
+        temp: latestSocTemp,
+        pl1Msr: latestMsrLimits.pl1,
+        pl1Mmio: latestMmioLimits.pl1,
+        pl1Effective: latestPl1,
+        reasonsSeen: latestLimitReasons?.seen || latestLimitReasons?.active || [],
+        tcc: latestTcc,
+        prochot: latestProchot,
+        fanRpm: detectedFanRpms.slice(0, Math.max(detectedFanCount, 1)),
+        fanHal: halFanDevices.map((device) => ({ name: device.name, cur: device.cur, duty: halFanDutyPercent(device) }))
+    });
+}
+
+function finishVerifyRun(aborted = false) {
+    if (!verifyRun) return;
+    const run = verifyRun;
+    verifyRun = null;
+    const verifyEl = document.getElementById('verify-status');
+    const report = buildVerifyReport(run, aborted);
+    if (verifyEl) verifyEl.innerText = aborted ? 'stopped' : report.verdict;
+    renderVerifyResult(run, report, aborted);
+    appendConsole(`[Verify] ${aborted ? 'Stopped. ' : ''}${report.lines.map((item) => item.text).join(' | ')}`);
+}
+
+function buildVerifyReport(run, aborted) {
+    const samples = run.samples.filter((sample) => Number.isFinite(sample.pkg));
+    const lines = [];
+    const push = (text, cls = '') => lines.push({ text, cls });
+    const fmt = (value, digits = 1, suffix = '') => formatTuneValue(value, digits, suffix);
+    const plateau = samples.slice(Math.floor(samples.length * 2 / 3));
+    const plateauPower = average(plateau.map((sample) => sample.pkg));
+    const peakPower = samples.length ? Math.max(...samples.map((sample) => sample.pkg)) : null;
+    const temperatures = samples.map((sample) => sample.temp).filter(Number.isFinite);
+    const peakTemp = temperatures.length ? Math.max(...temperatures) : null;
+    const pl1Seen = samples.filter((sample) => sample.reasonsSeen.includes('PBM_PL1')).length;
+    const pl2Seen = samples.filter((sample) => sample.reasonsSeen.includes('PBM_PL2')).length;
+    const thermalSeen = samples.filter((sample) => sample.tcc || sample.prochot || sample.reasonsSeen.includes('THERMAL') || sample.reasonsSeen.includes('PROCHOT')).length;
+    const applied = run.applied.pl1;
+    const effectiveValues = samples.map((sample) => sample.pl1Effective).filter(Number.isFinite);
+    const effectiveMin = effectiveValues.length ? Math.min(...effectiveValues) : null;
+    const firstDrop = samples.find((sample) => Number.isFinite(sample.pl1Effective) && sample.pl1Effective < applied - 0.01);
+    let verdict = aborted ? 'stopped' : 'done';
+
+    push(`Workload: ${run.workloads.join(' + ')} \u00b7 ${run.duration}s \u00b7 ${samples.length} samples${aborted ? ' \u00b7 STOPPED EARLY' : ''}`, 'tune-muted');
+    if (!samples.length) {
+        push('No telemetry samples were captured during the run.', 'tune-warn');
+        return { lines, verdict: 'no data' };
+    }
+
+    // PL1: did the applied value actually govern the plateau?
+    const plateauText = `plateau ${fmt(plateauPower, 1, ' W')} (last third) \u00b7 peak ${fmt(peakPower, 1, ' W')}`;
+    if (Number.isFinite(applied)) {
+        if (firstDrop) {
+            const byMmio = Number.isFinite(firstDrop.pl1Mmio) && firstDrop.pl1Mmio < applied - 0.01 && !(Number.isFinite(firstDrop.pl1Msr) && firstDrop.pl1Msr < applied - 0.01);
+            const cause = byMmio ? 'intel-rapl-mmio:0 cap' : 'MSR limit reduction (controller not identified)';
+            push(`PL1 ${fmt(applied, 3, ' W')} applied \u2192 ${cause} started lowering it at t+${firstDrop.t}s, down to ${fmt(effectiveMin, 3, ' W')} \u00b7 ${plateauText}`, 'tune-warn');
+            verdict = `PL1 lowered to ${fmt(effectiveMin, 1, ' W')} (${byMmio ? 'MMIO' : 'MSR'})`;
+        } else if (pl1Seen > 0 && Number.isFinite(plateauPower) && Math.abs(plateauPower - applied) <= 1.5 && thermalSeen === 0) {
+            push(`PL1 ${fmt(applied, 3, ' W')} held \u2713 \u00b7 PBM_PL1 active in ${pl1Seen}/${samples.length} samples \u00b7 ${plateauText}`, 'tune-ok');
+            verdict = `PL1 ${fmt(applied, 1, ' W')} held \u2713`;
+        } else if (pl1Seen === 0 && run.duration < 45) {
+            push(`PL1 ${fmt(applied, 3, ' W')} not reached: run shorter than the PL1 time window (~30\u201345 s) \u00b7 ${plateauText}`, 'tune-muted');
+            verdict = 'too short for PL1';
+        } else if (pl1Seen === 0) {
+            push(`PL1 ${fmt(applied, 3, ' W')} never limited: workload peaked at ${fmt(peakPower, 1, ' W')} \u00b7 ${plateauText}`, 'tune-muted');
+            verdict = `PL1 ${fmt(applied, 1, ' W')} limiting not observed`;
+        } else {
+            push(`PL1 ${fmt(applied, 3, ' W')} \u00b7 PBM_PL1 active in ${pl1Seen}/${samples.length} samples \u00b7 ${plateauText}`, 'tune-ok');
+            verdict = `PL1 ${fmt(applied, 1, ' W')} active`;
+        }
+    }
+    if (Number.isFinite(run.applied.pl2)) {
+        push(`PL2 ${fmt(run.applied.pl2, 3, ' W')} \u00b7 PBM_PL2 active in ${pl2Seen}/${samples.length} samples \u00b7 burst peak ${fmt(peakPower, 1, ' W')}${peakPower < run.applied.pl2 - 1 ? ' (never reached)' : ''}`, pl2Seen ? 'tune-ok' : 'tune-muted');
+    }
+    const firstThermal = samples.find((sample) => sample.tcc || sample.prochot || sample.reasonsSeen.includes('THERMAL') || sample.reasonsSeen.includes('PROCHOT'));
+    push(`Temperature peak ${fmt(peakTemp, 1, ' \u00b0C')}${thermalSeen ? ` \u00b7 THERMAL/PROCHOT in ${thermalSeen} samples (first at t+${firstThermal.t}s)` : ' \u00b7 no thermal throttling'}`, thermalSeen ? 'tune-warn' : 'tune-ok');
+
+    // Fan: manual targets should hold; automatic shows what the governor did.
+    const fan = run.applied.fan;
+    const rpmSeries = plateau.map((sample) => sample.fanRpm[0]).filter(Number.isFinite);
+    const rpmRange = rpmSeries.length ? `${Math.min(...rpmSeries)}\u2013${Math.max(...rpmSeries)} RPM` : 'no RPM data';
+    const dutySeries = plateau.map((sample) => sample.fanHal[0]?.duty).filter(Number.isFinite);
+    const dutyRange = dutySeries.length ? ` \u00b7 ${fan.governor === 'thermal-hal' ? halFanDevices[0]?.name || 'TFN' : ''} duty ${Math.min(...dutySeries)}\u2013${Math.max(...dutySeries)}%` : '';
+    if (fan.mode === 'manual' && fan.targets?.length) {
+        const target = fan.targets[0];
+        const avgRpm = average(rpmSeries);
+        const deviation = Number.isFinite(avgRpm) && target.rpm ? Math.abs(avgRpm - target.rpm) / target.rpm : null;
+        const halFloor = fan.governor === 'thermal-hal';
+        const higherHalRequests = halFloor && Number.isFinite(target.state)
+            ? run.samples.filter((sample) => sample.fanHal[0] && sample.fanHal[0].cur > target.state).length : 0;
+        const metTarget = deviation !== null && (halFloor ? avgRpm >= target.rpm * 0.88 : deviation <= 0.12);
+        push(`Fan ${halFloor ? 'minimum' : 'manual'} ${target.rpm} RPM${halFloor ? ` (\u2248 ${target.duty}% duty floor)` : ''} \u2192 observed ${rpmRange} (avg ${fmt(avgRpm, 0)})${dutyRange}${higherHalRequests ? ` \u00b7 HAL requested higher cooling in ${higherHalRequests} samples (preserved)` : ''} ${metTarget ? (halFloor ? 'floor met \u2713' : '\u2713') : (halFloor ? '(floor not met)' : '(deviates >12%)')}`, metTarget ? 'tune-ok' : 'tune-warn');
+    } else {
+        push(`Fan ${fan.text} \u2192 observed ${rpmRange}${dutyRange}`, 'tune-muted');
+    }
+    return { lines, verdict: aborted ? 'stopped (partial data)' : verdict, metrics: { plateauPower, peakPower, peakTemp, pl1Seen, pl2Seen, thermalSeen, effectiveMin, firstDropAt: firstDrop?.t ?? null } };
+}
+
+function renderVerifyResult(run, report, aborted) {
+    const resultEl = document.getElementById('auto-tune-result');
+    const summaryEl = document.getElementById('auto-tune-summary');
+    const stateEl = document.getElementById('auto-tune-result-state');
+    const titleEl = document.getElementById('auto-tune-result-title');
+    const downloadEl = document.getElementById('auto-tune-download');
+    if (!resultEl || !summaryEl || !stateEl) return;
+    const startedText = new Date(run.startedAt).toLocaleString('en-US', { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+    const html = [`<span class="tune-muted">${escapeHtml(`${run.source === 'verify' ? 'Verify' : 'Stress test'} \u00b7 ${startedText} \u00b7 applied PL1 ${run.applied.pl1} / PL2 ${run.applied.pl2} / PL4 ${run.applied.pl4} W \u00b7 Fan: ${run.applied.fan.text}`)}</span>`];
+    report.lines.forEach((item) => html.push(item.cls ? `<span class="${item.cls}">${escapeHtml(item.text)}</span>` : escapeHtml(item.text)));
+    if (titleEl) titleEl.innerText = run.source === 'verify' ? '\u2714 Verify Result' : '\u2699 Run Result';
+    stateEl.innerText = aborted ? 'Stopped' : report.verdict;
+    summaryEl.innerHTML = html.join('\n');
+    resultEl.hidden = false;
+    if (downloadEl) { downloadEl.innerText = 'Download Result JSON'; downloadEl.title = ''; }
+    autoTuneResult = {
+        schemaVersion: 1,
+        profileName: `${run.source}-result-${new Date(run.startedAt).toISOString().replace(/[:.]/g, '-')}`,
+        source: `tpts-${run.source}`,
+        device: { product: deviceProductName, platform: devicePlatformName },
+        workloads: run.workloads,
+        durationSeconds: run.duration,
+        aborted,
+        applied: run.applied,
+        verdict: report.verdict,
+        summary: report.lines.map((item) => item.text),
+        metrics: report.metrics || null,
+        samples: run.samples
+    };
+    if (run.source === 'verify') resultEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function applyAndVerify() {
+    if (!isDeviceConnected) return alert('Connect device first!');
+    if (isPipelineRunning) {
+        if (verifyRun?.source === 'verify') return startThermalPipeline();
+        return alert('A test is already running. Stop it on the Stress page first.');
+    }
+    const duration = Math.max(30, parseInt(document.getElementById('verify-duration')?.value, 10) || 60);
+    const selected = getSelectedWorkloads().filter((workload) => workload !== 'geekbench');
+    const workloads = selected.length ? selected : ['stressapptest'];
+    if (applyPowerLimits() !== true) return;
+    const verifyEl = document.getElementById('verify-status');
+    if (verifyEl) verifyEl.innerText = 'applying...';
+    // Let the MSR/MMIO writes land and echo back before the workload starts.
+    setTimeout(() => startThermalPipeline({ workloads, durationSeconds: duration, source: 'verify' }), 1500);
 }
 
 function startPipelineCountdown(seconds, label = 'Countdown') {
@@ -1374,6 +1840,7 @@ function stopPipelineCountdown() {
 
 function lockGlobalUiForPipeline() {
     isPipelineRunning = true;
+    pipelineAwaitingStart = true;
     document.querySelectorAll('button').forEach(btn => {
         btn.disabled = true; btn.style.opacity = "0.4"; btn.style.cursor = "not-allowed";
     });
@@ -1432,8 +1899,12 @@ function stopMonitoringElapsedCounter() {
 function restoreAllUiToIdle(resumeMonitoring = true) {
     if (!isPipelineRunning) return;
     isPipelineRunning = false; 
+    pipelineAwaitingStart = false;
     stopPipelineCountdown();
     finishGeekbenchRun();
+    finishVerifyRun(true);
+    const verifyButton = document.getElementById('verify-start-button');
+    if (verifyButton) verifyButton.innerText = 'Apply & Verify';
 
     document.querySelectorAll('button, input, select').forEach(el => {
         el.disabled = false; el.style.opacity = "1.0"; el.style.cursor = "pointer";
@@ -1791,18 +2262,19 @@ function exportGeekbenchResults() {
     URL.revokeObjectURL(url);
 }
 
-function startThermalPipeline() {
+function startThermalPipeline(options = {}) {
     if (!isDeviceConnected) return alert("Connect device first!");
     
     if (isPipelineRunning) {
         sendAdb(['STOP_PIPELINE']);
         stopPipelineCountdown();
         finishGeekbenchRun(true);
+        finishVerifyRun(true);
         restoreAllUiToIdle();
         return;
     }
 
-    const workloads = getSelectedWorkloads();
+    const workloads = options.workloads || getSelectedWorkloads();
     if (workloads.length === 0) {
         return alert("Select at least one stress workload.");
     }
@@ -1845,12 +2317,22 @@ function startThermalPipeline() {
         drawPowerChartGrid();
     }
     const durationEl = document.getElementById('duration');
-    const sec = geekbenchMode ? String(GEEKBENCH_MODE_MIN_DURATION_SECONDS) : (durationEl ? durationEl.value : "60");
+    const sec = geekbenchMode ? String(GEEKBENCH_MODE_MIN_DURATION_SECONDS) : String(options.durationSeconds || (durationEl ? durationEl.value : "60"));
     const fishCountInput = document.getElementById('aquarium-fish-count');
     const fishCount = fishCountInput?.value || "30000";
     if (workloads.includes('aquarium') && (!/^\d+$/.test(fishCount) || Number(fishCount) < 1)) {
         restoreAllUiToIdle();
         return alert('Fish count must be a positive integer.');
+    }
+    if (!geekbenchMode && !autoTuneDryRun) beginVerifyRun(workloads, Number(sec), options.source || 'stress');
+    if (options.source === 'verify') {
+        const verifyButton = document.getElementById('verify-start-button');
+        if (verifyButton) {
+            verifyButton.disabled = false;
+            verifyButton.style.opacity = '1';
+            verifyButton.style.cursor = 'pointer';
+            verifyButton.innerText = 'Stop Verify';
+        }
     }
     if (geekbenchMode) {
         startPipelineCountdown(estimateGeekbenchSeconds(geekbench), 'Geekbench est. remaining');
@@ -2151,6 +2633,10 @@ function renderThermalTuneResult(session, trigger) {
     resultEl.hidden = false;
     stateEl.innerText = trigger ? 'Power reduced' : 'Completed';
     summaryEl.innerHTML = html.join('\n');
+    const titleEl = document.getElementById('auto-tune-result-title');
+    if (titleEl) titleEl.innerText = '\u2699 Auto Tune Result';
+    const downloadEl = document.getElementById('auto-tune-download');
+    if (downloadEl) downloadEl.innerText = 'Download Power Profile';
 }
 
 function updateAutoTuneObjectiveHint() {
@@ -2197,8 +2683,9 @@ function startAutoTuneDryRun() {
         fanMode.value = 'auto';
         applyFanSettings();
     }
+    const fanOwner = fanGovernor() === 'thermal-hal' ? 'Thermal HAL' : 'EC';
     const statusEl = document.getElementById('auto-tune-status');
-    if (statusEl) statusEl.innerText = `Auto Tune in progress. EC fan control is automatic; SoC uses a ${getThermalTuneSocWindowSeconds()}s average reference.`;
+    if (statusEl) statusEl.innerText = `Auto Tune in progress. ${fanOwner} fan control is automatic; SoC uses a ${getThermalTuneSocWindowSeconds()}s average reference.`;
     startThermalPipeline();
 }
 
@@ -2259,7 +2746,7 @@ function finishAutoTuneDryRun() {
         schemaVersion: 1,
         profileName: `ec-auto-tune-${new Date().toISOString().replace(/[:.]/g, '-')}`,
         source: 'tpts-ec-auto-tune',
-        fanControl: 'ectool autofanctrl',
+        fanControl: fanGovernor() === 'thermal-hal' ? `thermal-hal (${halFanDevices.map((device) => device.name).join('/')})` : 'ectool autofanctrl',
         limits: getThermalTuneThresholds(),
         socAveragingPeriodSeconds: getThermalTuneSocWindowSeconds(),
         recovery: { holdSeconds: control.settleSeconds, hysteresisCelsius: control.hysteresisCelsius },
@@ -2660,6 +3147,7 @@ function recordTelemetrySample() {
         tcc: latestTcc,
         prochot: latestProchot,
         fans: detectedFanRpms.slice(),
+        fanHalDuty: halFanDevices.map((device) => halFanDutyPercent(device)),
         thermalZones: Object.fromEntries([...thermalZoneMetricKeys.values()].map((zone) => [zone.metricKey, zone.latestTemperature]))
     });
     if (telemetryLog.length > MAX_TELEMETRY_LOG_ROWS) telemetryLog.shift();
@@ -2908,6 +3396,11 @@ socket.onmessage = (event) => {
         if (processThermalJsonBackendOutput(rawLog)) return;
         if (processGeekbenchOutput(rawLog)) return;
         parseMsrUnits(rawLog);
+        const mmioMatch = rawLog.match(/MMIO_PL_UW:\s*(\S+)/i);
+        if (mmioMatch) {
+            parseMmioLimitsField(mmioMatch[1]);
+            rerenderPowerLimitHints();
+        }
 
         if (rawLog.includes("TPTS_TUNING_SYNC_BEGIN")) {
             tuningSyncInProgress = true;
@@ -2921,6 +3414,11 @@ socket.onmessage = (event) => {
             const syncTagged601 = tuningSyncBuffer.match(/MSR_601:\s*(0x[0-9a-fA-F]+|[0-9a-fA-F]+)/i);
             const defaultTagged610 = tuningSyncBuffer.match(/TPTS_DEFAULT_610:\s*(0x[0-9a-fA-F]+|[0-9a-fA-F]+)/i);
             const defaultTagged601 = tuningSyncBuffer.match(/TPTS_DEFAULT_601:\s*(0x[0-9a-fA-F]+|[0-9a-fA-F]+)/i);
+            const defaultMmioMatch = tuningSyncBuffer.match(/TPTS_DEFAULT_MMIO:\s*(\S+)/i);
+            if (defaultMmioMatch && defaultMmioMatch[1] !== 'NA/NA/NA') {
+                const parts = defaultMmioMatch[1].split('/');
+                ['pl1', 'pl2', 'pl4'].forEach((key, index) => { if (/^\d+$/.test(parts[index] || '')) tuningDefaultMmio[key] = parts[index]; });
+            }
             const syncTokens = tuningSyncBuffer.match(/0x[0-9a-fA-F]+|[0-9a-fA-F]{6,16}/g) || [];
             tuningSyncInProgress = false;
             tuningSyncBuffer = '';
@@ -2968,7 +3466,10 @@ socket.onmessage = (event) => {
             }
         }
 
+        if (rawLog.includes('[TPTS] Starting automated thermal pipeline')) pipelineAwaitingStart = false;
+
         if (rawLog.trim().includes("[TPTS_SIGNAL_FORCE_UNLOCKED]") || rawLog.includes("FORCE_UNLOCKED")) {
+            if (pipelineAwaitingStart && !pendingDeviceConnect) return;
             if (pendingDeviceConnect) {
                 const { ip, previousTarget } = pendingDeviceConnect;
                 pendingDeviceConnect = null;
@@ -3147,13 +3648,32 @@ socket.onmessage = (event) => {
             renderRestPower(false);
         }
         if (discoveredPower !== undefined) updatePowerChart(discoveredPower);
+        const halFanMatch = rawLog.match(/(?:^|\s)FAN_HAL:\s*(\S+)/i);
+        if (halFanMatch) applyHalFanReport(halFanMatch[1]);
+        for (const fpsMatch of rawLog.matchAll(/FAN_FPS:\s*([A-Za-z0-9_-]+)=(\S+)/gi)) {
+            const table = fpsMatch[2] === 'NA' ? [] : fpsMatch[2].split(',').map((pair) => {
+                const [pct, rpm] = pair.split('=').map(Number);
+                return Number.isFinite(pct) && Number.isFinite(rpm) ? { pct, rpm } : null;
+            }).filter(Boolean);
+            halFanFpsTable[fpsMatch[1]] = table;
+            updateHalFanInputHints();
+        }
+        const halBoundMatch = rawLog.match(/FAN_HAL_BOUND:\s*(\d+)/i);
+        if (halBoundMatch) {
+            const bound = parseInt(halBoundMatch[1], 10);
+            if (bound !== halFanBoundSensors) {
+                halFanBoundSensors = bound;
+                fanControlRenderedCount = -1;
+                syncFanControlInputs();
+            }
+        }
         const rawFanCountMatch = rawLog.match(/Number of fans\s*=\s*(\d+)/i);
         if (rawFanCountMatch) {
             detectedFanCount = parseInt(rawFanCountMatch[1], 10);
             detectedFanRpms = Array.from({ length: detectedFanCount }, (_, index) => detectedFanRpms[index] ?? null);
             renderFanSpeeds();
         }
-        const isFanLike = /Number of fans|Fan\s+\d+\s+RPM|pwm(get|set)|fanduty|autofanctrl|unrecognized subcommand/i.test(rawLog);
+        const isFanLike = /Number of fans|Fan\s+\d+\s+RPM|pwm(get|set)|fanduty|autofanctrl|unrecognized subcommand|FAN_HAL/i.test(rawLog);
         if (isFanLike && !rawLog.includes('TPTS_SAMPLE')) {
             const cleaned = rawLog.replace(/TPTS_FAN_(BEGIN|END)/g, '').trim();
             if (cleaned) appendConsole(`[Fan] ${cleaned}`);
@@ -3194,6 +3714,8 @@ socket.onmessage = (event) => {
                 detectedFanRpms = Array.from({ length: fanCount }, (_, index) => reportedRpms[index] ?? null);
                 renderFanSpeeds();
             }
+            if (halFanMatch) updateHalFanCalibration();
+            renderRunSettingsSnapshot();
         }
 
         // ⚡ MSR 0x610 (PL1 / PL2) 安全字串切片拆解大腦 ➔ 直接填入 Label 靠右小字提示中
@@ -3299,7 +3821,10 @@ socket.onmessage = (event) => {
         }
         const raplSampleComplete = rawLog.includes('TPTS_SAMPLE_END') || rawLog.includes('TPTS_POWER_SAMPLE_END');
         const stressSampleComplete = raplSampleComplete || (!awaitingRaplSampleEnd && /^PKG_POWER_MW:\s*\d+/i.test(rawLog.trim()));
-        if (isPipelineRunning && stressSampleComplete) evaluateThermalTuneGuard();
+        if (isPipelineRunning && stressSampleComplete) {
+            evaluateThermalTuneGuard();
+            recordVerifySample();
+        }
         if (chartingActive && Date.now() >= telemetryHistoryReadyAt && ((awaitingRaplSampleEnd && raplSampleComplete) || (!awaitingRaplSampleEnd && (discoveredTemp !== null || rawLog.includes('TPTS_SAMPLE:'))))) {
             recordTelemetrySample();
         }
@@ -3335,8 +3860,9 @@ socket.onmessage = (event) => {
             consoleBox.scrollTop = consoleBox.scrollHeight;
         }
 
-        if (/^FINISHED:|^\[Complete\] Pipeline finished\./im.test(rawLog)) {
+        if (!pipelineAwaitingStart && /^FINISHED:|^\[Complete\] Pipeline finished\./im.test(rawLog)) {
             finishAutoTuneDryRun();
+            finishVerifyRun(false);
             restoreAllUiToIdle();
         }
 

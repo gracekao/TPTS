@@ -285,10 +285,32 @@ TPTS_CSV_HEADER="$TPTS_CSV_HEADER,MSR_0x64F_all_cores,MSR_0x64F_active_last_1s,C
 if [ "$1" = "--monitor" ]; then
     MONITOR_LOG=/data/local/tmp/tpts_monitor.csv
     MONITOR_FLAG=/data/local/tmp/tpts_monitor_logging
+    # Thermal HAL fan cooling devices: duty % = cur_state * (100 / max_state).
+    hal_fan_collect() {
+        HAL_FAN=
+        for cdev in /dev/thermal/cdev-by-name/TFN*; do
+            [ -e "$cdev/cur_state" ] || continue
+            name=${cdev##*/}
+            HAL_FAN="${HAL_FAN:+$HAL_FAN,}$name:$(cat "$cdev/cur_state" 2>/dev/null)/$(cat "$cdev/max_state" 2>/dev/null)"
+        done
+        [ -n "$HAL_FAN" ] || HAL_FAN=NA
+    }
+
+    # Firmware-side power limits on intel-rapl-mmio:0 (PL1/PL2/PL4); the PMC enforces min(MSR, MMIO).
+    mmio_pl_collect() {
+        MMIO_PL=
+        for c in 0 1 2; do
+            v=$(cat /sys/class/powercap/intel-rapl-mmio:0/constraint_${c}_power_limit_uw 2>/dev/null)
+            MMIO_PL="${MMIO_PL:+$MMIO_PL/}${v:-NA}"
+        done
+        [ "$MMIO_PL" = NA/NA/NA ] && MMIO_PL=NA
+    }
 
     monitor_tick() {
         rapl_collect
         freq_collect
+        hal_fan_collect
+        mmio_pl_collect
         temp_value=
         for z in /sys/class/thermal/thermal_zone*; do
             if [ "$(cat "$z/type" 2>/dev/null)" = "x86_pkg_temp" ]; then temp_value=$(cat "$z/temp" 2>/dev/null); break; fi
@@ -315,7 +337,7 @@ if [ "$1" = "--monitor" ]; then
         m601=$(/data/local/tmp/iotools rdmsr 0 0x601 2>/dev/null)
         m64f=$(/data/local/tmp/iotools rdmsr 0 0x64F 2>/dev/null)
         m6b0=$(/data/local/tmp/iotools rdmsr 0 0x6B0 2>/dev/null)
-        echo "TPTS_SAMPLE: TARGET_SYSFS_TEMP: ${temp_value:-NA} CPU_FREQ_KHZ: ${freq_value:-NA} FAN_COUNT: ${fan_count:-0} FAN_RPMS: ${fan_values:-NA} PKG_POWER_MW: $PKG_POWER_MW IA_MW: $IA_POWER_MW GT_MW: $GT_POWER_MW MSR_606: $m606 MSR_1A2: $m1a2 MSR_1B1: $m1b1 MSR_610: $m610 MSR_601: $m601 MSR_64F: $m64f MSR_6B0: $m6b0"
+        echo "TPTS_SAMPLE: TARGET_SYSFS_TEMP: ${temp_value:-NA} CPU_FREQ_KHZ: ${freq_value:-NA} FAN_COUNT: ${fan_count:-0} FAN_RPMS: ${fan_values:-NA} FAN_HAL: $HAL_FAN MMIO_PL_UW: $MMIO_PL PKG_POWER_MW: $PKG_POWER_MW IA_MW: $IA_POWER_MW GT_MW: $GT_POWER_MW MSR_606: $m606 MSR_1A2: $m1a2 MSR_1B1: $m1b1 MSR_610: $m610 MSR_601: $m601 MSR_64F: $m64f MSR_6B0: $m6b0"
         for z in /sys/class/thermal/thermal_zone*; do
             [ -d "$z" ] || continue
             tz_type=$(cat "$z/type" 2>/dev/null | tr "[:space:]" "_")
