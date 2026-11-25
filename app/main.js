@@ -5,7 +5,7 @@ const wsHost = window.location.host || '127.0.0.1:8080';
 const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
 const socket = new WebSocket(`${wsProtocol}://${wsHost}/ws`);
 // Must match tptsVersion in proxy/main.go.
-const TPTS_APP_VERSION = '2026.10.27-2';
+const TPTS_APP_VERSION = '2026.11.25-1';
 let backendVersionChecked = false;
 // Per-second sampler output; kept out of the System Log during stress tests.
 const TELEMETRY_STREAM_LINE = /^(TPTS_SAMPLE|TPTS_THERMAL_ZONE|RAPL_SAMPLE|CPU_LIMIT_SAMPLE)/;
@@ -95,10 +95,15 @@ let awaitingStructuredSampleEnd = false;
 let thermalJsonPath = '';
 let thermalJsonDefaultPath = '';
 let thermalJsonDefaultText = '';
+let thermalJsonLoadedText = '';
 let thermalJsonLoadBuffer = '';
 let thermalJsonLoading = false;
 let thermalJsonApplyBuffer = '';
 let thermalJsonApplying = false;
+let thermalFanFloorTimer = null;
+let pendingThermalFanFloorTimeoutSeconds = null;
+let pendingFanFloorVerify = null;
+let fanFloorRestoring = false;
 let thermalJsonPreviewOnly = false;
 let autoTuneDryRun = null;
 let autoTuneResult = null;
@@ -787,6 +792,12 @@ function setThermalJsonStatus(message, isError = false) {
     statusEl.style.color = isError ? '#ff6672' : '#8990aa';
 }
 
+function clearThermalFanFloorTimer() {
+    if (thermalFanFloorTimer !== null) clearTimeout(thermalFanFloorTimer);
+    thermalFanFloorTimer = null;
+    pendingThermalFanFloorTimeoutSeconds = null;
+}
+
 function getCurrentTarget() {
     return normalizeTarget(document.getElementById('ip') ? document.getElementById('ip').value : '');
 }
@@ -895,6 +906,7 @@ function describeJsonParseError(text, error) {
 
 function applyThermalJsonConfig() {
     if (!isDeviceConnected) return alert('Connect device first!');
+    if (pendingFanFloorVerify || fanFloorRestoring) return alert('Wait for Verify fan setup or restoration to finish.');
     if (thermalJsonPreviewOnly) return alert('This is a HAL overlay preview, not a complete device JSON. Load the full device JSON before saving.');
     const editor = document.getElementById('thermal-json-editor');
     const pathEl = document.getElementById('thermal-json-path');
@@ -904,18 +916,24 @@ function applyThermalJsonConfig() {
     if (!editor || !editor.value.trim()) return alert('Load or paste thermal JSON first.');
     if (!path || path === 'Not loaded') return alert('Load the target file path from device first.');
     if (!validateThermalJsonEditor(false)) return;
+    let config;
+    try { config = removeTemporaryHalFanFloors(parseThermalJsonText(editor.value).value); }
+    catch (error) { return alert(`Thermal HAL JSON is invalid: ${error.message}`); }
+    clearThermalFanFloorTimer();
     showThermalJsonWorkspace();
     setThermalJsonStatus('Saving JSON to /data/local/tmp and restarting thermal HAL...');
-    sendBackendCommand(['THERMAL_JSON_APPLY', target, path], editor.value);
+    sendBackendCommand(['THERMAL_JSON_APPLY', target, path], JSON.stringify(config));
 }
 
 function restoreThermalJsonDefault() {
     if (!isDeviceConnected) return alert('Connect device first!');
+    if (pendingFanFloorVerify || fanFloorRestoring) return alert('Wait for Verify fan setup or restoration to finish.');
     const target = getCurrentTarget();
     const pathEl = document.getElementById('thermal-json-path');
     const path = pathEl ? pathEl.value.trim() : thermalJsonPath;
     if (!target) return alert('Please enter IP or local');
     if (!path || path === 'Not loaded') return alert('Load the target file path from device first.');
+    clearThermalFanFloorTimer();
     showThermalJsonWorkspace();
     setThermalJsonStatus('Restoring default thermal JSON and restarting thermal HAL...');
     sendBackendCommand(['THERMAL_JSON_RESTORE_DEFAULT', target, path]);
@@ -953,8 +971,10 @@ function processThermalJsonBackendOutput(rawLog) {
                 const result = parseThermalJsonText(jsonText);
                 loadedNormalized = result.normalized;
                 editor.value = JSON.stringify(result.value, null, 2);
+                thermalJsonLoadedText = JSON.stringify(result.value);
             } catch (error) {
                 editor.value = jsonText;
+                thermalJsonLoadedText = '';
             }
             const backupText = defaultCreatedMatch && defaultCreatedMatch[1] === '1' ? ' Default backup created.' : ' Default backup ready.';
             const normalizeText = loadedNormalized ? ' Trailing commas normalized.' : '';
@@ -985,21 +1005,69 @@ function processThermalJsonBackendOutput(rawLog) {
         const svcText = svcMatch ? svcMatch[1].trim() : '';
         const logcatMatch = thermalJsonApplyBuffer.match(/TPTS_THERMAL_LOGCAT_BEGIN\r?\n([\s\S]*?)\r?\nTPTS_THERMAL_LOGCAT_END/);
         const logcatText = logcatMatch ? logcatMatch[1].trim() : '';
+        if (fanFloorRestoring && (thermalJsonApplyBuffer.includes('TPTS_THERMAL_FAN_FLOOR_RESTORE_DONE') || thermalJsonApplyBuffer.includes('TPTS_FAN_FLOOR_INACTIVE=1') || errorMatch)) {
+            fanFloorRestoring = false;
+            const status = document.getElementById('verify-status');
+            if (status) status.innerText = errorMatch || (restartConfirmedMatch && restartConfirmedMatch[1] !== '1') ? 'fan restore failed' : 'fan restored';
+        }
+        if (pendingFanFloorVerify) {
+            const pending = pendingFanFloorVerify;
+            pendingFanFloorVerify = null;
+            clearTimeout(pending.timer);
+            const button = document.getElementById('verify-start-button');
+            if (button) button.disabled = false;
+            if (!errorMatch && thermalJsonApplyBuffer.includes('TPTS_FAN_FLOOR_SENSOR_LOADED=1') && thermalJsonApplyBuffer.includes('TPTS_FAN_FLOOR_WATCHDOG=1') && isDeviceConnected && connectedDeviceTarget === pending.target) {
+                setTimeout(() => {
+                    if (isDeviceConnected && connectedDeviceTarget === pending.target && !isPipelineRunning) {
+                        startThermalPipeline({ workloads: pending.workloads, durationSeconds: pending.duration, source: 'verify', fanFloor: { target: pending.target, path: pending.path } });
+                    } else {
+                        sendBackendCommand(['THERMAL_FAN_FLOOR_STOP', pending.target, pending.path]);
+                    }
+                }, 1500);
+            } else {
+                sendBackendCommand(['THERMAL_FAN_FLOOR_STOP', pending.target, pending.path]);
+                const status = document.getElementById('verify-status');
+                if (status) status.innerText = 'fan floor failed';
+                appendConsole('[Verify] Fan floor was not confirmed; the test was not started.');
+            }
+        }
         if (thermalJsonApplyBuffer.includes('TPTS_THERMAL_APPLY_DONE')) {
-            const restored = thermalJsonApplyBuffer.includes('TPTS_THERMAL_RESTORE_DEFAULT_DONE');
+            const floorRestored = thermalJsonApplyBuffer.includes('TPTS_THERMAL_FAN_FLOOR_RESTORE_DONE');
+            const restored = thermalJsonApplyBuffer.includes('TPTS_THERMAL_RESTORE_DEFAULT_DONE') || floorRestored;
+            const floorStarted = thermalJsonApplyBuffer.includes('TPTS_FAN_FLOOR_WATCHDOG=1');
             const contentMatched = thermalJsonApplyBuffer.includes('CONTENT_MATCH=1');
             const restartConfirmed = restartConfirmedMatch ? restartConfirmedMatch[1] === '1' : null;
-            const statusPrefix = restored ? 'Default restored' : 'Applied';
+            const statusPrefix = floorRestored ? 'Previous active configuration restored' : restored ? 'Default restored' : 'Applied';
             const restartText = restartConfirmed === null ? 'vendor.thermal-hal restart not verified.' : (restartConfirmed ? 'vendor.thermal-hal confirmed restarted (running -> stopped -> running).' : 'vendor.thermal-hal restart NOT confirmed (stop did not take effect).');
-            setThermalJsonStatus(`${statusPrefix}. ${contentMatched ? 'Target content verified.' : 'Check verification output.'} ${restartText}`, restartConfirmed === false);
-            appendConsole(`[Thermal JSON] ${statusPrefix}. ${contentMatched ? 'Target content matches source.' : 'Content match was not confirmed.'} ${restartText} ${verifyText || 'Mount verification returned no matching line.'}`);
+            setThermalJsonStatus(`${errorMatch ? `${errorMatch[1]} ` : ''}${statusPrefix}. ${contentMatched ? 'Target content verified.' : 'Check verification output.'} ${restartText}`, Boolean(errorMatch) || restartConfirmed === false);
+            appendConsole(`[Thermal JSON] ${statusPrefix}. ${contentMatched ? 'Target content matches source.' : 'Content match was not confirmed.'} ${restartText}${errorMatch ? ` Error: ${errorMatch[1]}` : ''} ${verifyText || 'Mount verification returned no matching line.'}`);
             if (svcText) appendConsole(`[Thermal JSON] vendor.thermal-hal state:\n${svcText}`);
             if (logcatText) appendConsole(`[Thermal JSON] Recent logcat (pixel-thermal):\n${logcatText}`);
+            if (floorStarted && Number.isFinite(pendingThermalFanFloorTimeoutSeconds)) {
+                const timeoutSeconds = pendingThermalFanFloorTimeoutSeconds;
+                clearThermalFanFloorTimer();
+                thermalFanFloorTimer = setTimeout(() => {
+                    thermalFanFloorTimer = null;
+                    const modeEl = document.getElementById('tune-fan-mode');
+                    if (modeEl && fanGovernor() === 'thermal-hal') {
+                        modeEl.value = 'auto';
+                        renderFanControlInputs();
+                        appendConsole('[Thermal HAL] Fan RPM floor timeout reached; refreshing HAL fan state.');
+                        requestFanInventory(getCurrentTarget());
+                    }
+                }, timeoutSeconds * 1000);
+            } else if (floorRestored) {
+                clearThermalFanFloorTimer();
+            }
             // Refresh the editor with what is now actually on device so it never shows stale content after a restore.
             if (restored && contentMatched) loadThermalJsonConfig();
         } else if (errorMatch) {
+            clearThermalFanFloorTimer();
             setThermalJsonStatus(errorMatch[1], true);
             appendConsole(`[Thermal JSON] ${errorMatch[1]}`);
+        } else if (thermalJsonApplyBuffer.includes('TPTS_FAN_FLOOR_INACTIVE=1')) {
+            setThermalJsonStatus('No temporary fan floor is active.');
+            appendConsole('[Thermal HAL] No temporary fan floor is active.');
         } else {
             setThermalJsonStatus('Apply finished without success marker. Check system log.', true);
             appendConsole('[Thermal JSON] Apply finished without success marker.');
@@ -1101,11 +1169,14 @@ function updateFanModeOptions() {
     const manualOption = modeEl.querySelector('option[value="manual"]');
     if (governor !== fanModeOptionsGovernor) {
         fanModeOptionsGovernor = governor;
-        if (autoOption) autoOption.textContent = governor === 'thermal-hal' ? 'Automatic (Thermal HAL)' : 'Automatic (EC autofanctrl)';
-        if (manualOption) manualOption.textContent = governor === 'thermal-hal' ? 'Manual RPM (unavailable; Thermal HAL owns fan)' : 'Manual RPM';
+        if (autoOption) autoOption.textContent = governor === 'thermal-hal' ? 'Automatic (Thermal HAL)' : 'Automatic (platform; read-only)';
+        if (manualOption) {
+            manualOption.textContent = governor === 'thermal-hal' ? 'RPM Floor (HAL)' : 'RPM Floor (HAL required)';
+            manualOption.title = 'Temporary minimum RPM request through Thermal HAL; HAL can request more cooling.';
+        }
     }
-    if (manualOption) manualOption.disabled = governor === 'thermal-hal';
-    if (governor === 'thermal-hal' && modeEl.value === 'manual') modeEl.value = 'auto';
+    if (manualOption) manualOption.disabled = governor !== 'thermal-hal';
+    if (governor !== 'thermal-hal') modeEl.value = 'auto';
 }
 
 function renderFanControlInputs() {
@@ -1116,11 +1187,37 @@ function renderFanControlInputs() {
     const isManual = modeEl && modeEl.value === 'manual';
     const governor = fanGovernor();
     const hintEl = document.getElementById('fan-count-hint');
+    const durationGroup = document.getElementById('fan-floor-duration-group');
+    if (durationGroup) durationGroup.hidden = true;
 
     if (governor === 'thermal-hal') {
+        const previousInputs = new Map([...container.querySelectorAll('input[data-hal-cdev]')].map((input) => [input.dataset.halCdev, input.value]));
         container.innerHTML = '';
-        container.hidden = true;
+        halFanDevices.forEach((device, index) => {
+            const group = document.createElement('div');
+            group.className = 'form-group';
+            const label = document.createElement('label');
+            label.textContent = `${device.name} minimum RPM`;
+            const input = document.createElement('input');
+            input.type = 'number';
+            input.min = '1';
+            input.step = '100';
+            input.dataset.halCdev = device.name;
+            const currentRpm = detectedFanRpms[index];
+            const estimatedRpm = halFanDutyToRpm(device, halFanDutyPercent(device) ?? 50);
+            const fallbackRpm = Number.isFinite(currentRpm) && currentRpm > 0 ? currentRpm : estimatedRpm;
+            input.value = previousInputs.get(device.name) ?? (fallbackRpm > 0 ? String(fallbackRpm) : '3000');
+            input.disabled = !isManual;
+            input.addEventListener('input', updateHalFanInputHints);
+            const hint = document.createElement('small');
+            hint.className = 'fan-duty-hint';
+            group.append(label, input, hint);
+            container.appendChild(group);
+        });
+        updateHalFanInputHints();
+        container.hidden = !isManual;
         container.style.opacity = '1.0';
+        if (durationGroup) durationGroup.hidden = !isManual;
         renderFanAutoHint();
         if (hintEl) {
             const names = halFanDevices.map((device) => device.name).join('/');
@@ -1169,18 +1266,20 @@ function renderFanControlInputs() {
 
 function renderFanAutoHint() {
     const autoHint = document.getElementById('fan-auto-hint');
+    const floorHint = document.getElementById('fan-floor-hint');
     if (!autoHint) return;
     const isManual = document.getElementById('tune-fan-mode')?.value === 'manual';
     autoHint.hidden = isManual;
+    if (floorHint) floorHint.hidden = !(isManual && fanGovernor() === 'thermal-hal');
     if (isManual) return;
     const liveRpms = detectedFanRpms.slice(0, detectedFanCount).filter((rpm) => Number.isFinite(rpm));
     const rpmText = liveRpms.length ? ` (now ${liveRpms.join(' / ')} RPM)` : '';
     if (fanGovernor() === 'thermal-hal') {
         const duty = halFanDevices.map((device) => `${device.name} ${halFanDutyPercent(device) ?? '--'}%`).join(', ');
-        autoHint.innerText = `Thermal HAL controls ${duty}${rpmText}. Direct RPM writes are disabled to preserve HAL thermal protection; tune the fan curve in Thermal HAL JSON.`;
+        autoHint.innerText = `Thermal HAL controls ${duty}${rpmText}. Adjust its automatic curve in Thermal HAL JSON; ectool RPM is read-only feedback.`;
         return;
     }
-    autoHint.innerText = `The EC controls fan speed${rpmText}. Switch to Manual RPM to set a fixed speed.`;
+    autoHint.innerText = `Platform automatic fan control${rpmText}. RPM feedback is read-only; manual tuning requires a supported Thermal HAL fan.`;
 }
 
 function syncFanControlInputs() {
@@ -1220,11 +1319,13 @@ function toggleFanInput() {
 }
 
 function connectDevice() {
+    if (pendingFanFloorVerify || fanFloorRestoring) return alert('Wait for the fan floor setup or restoration to finish before changing devices.');
     let ipEl = document.getElementById('ip');
     if (!ipEl) return;
     const ip = normalizeTarget(ipEl.value);
     if (!ip) return alert("Please enter IP or local");
     ipEl.value = ip;
+    clearThermalFanFloorTimer();
     const previousTarget = connectedDeviceTarget;
     resetLiveDeviceState();
 
@@ -1279,6 +1380,8 @@ function beginDeviceConnection(ip, previousTarget = '') {
 
 function resetLiveDeviceState() {
     isDeviceConnected = false;
+    thermalJsonPath = '';
+    thermalJsonLoadedText = '';
     deviceProductName = '';
     devicePlatformName = '';
     if (chartingActive && connectedDeviceTarget) sendAdb(['MONITOR_LOG_STOP', connectedDeviceTarget]);
@@ -1510,79 +1613,40 @@ function resetPowerLimitsToSystemDefault() {
     requestTuningDefaults(true);
 }
 
-function applyFanSettings() {
+function prepareHalFanFloor() {
     if (!isDeviceConnected) return alert("Connect device first!");
-
-    const target = normalizeTarget(document.getElementById('ip') ? document.getElementById('ip').value : '');
-    const modeEl = document.getElementById('tune-fan-mode');
-    const consoleBox = document.getElementById('console');
-    if (!target || !modeEl) return;
-
-    const mode = modeEl.value;
-    let cmd = '';
-    let summary = '';
-    const governor = fanGovernor();
-    const halManualFile = '/data/local/tmp/tpts_fan_manual';
-
-    if (governor === 'thermal-hal' && mode === 'manual') {
-        alert('Manual RPM is unavailable while Thermal HAL owns this fan. Edit the Thermal HAL fan curve instead.');
-        modeEl.value = 'auto';
-        renderFanControlInputs();
-        return;
-    } else if (governor === 'thermal-hal') {
-        cmd = `su 0 sh -c 'rm -f ${halManualFile}; echo FAN_SET_DONE'`;
-        summary = 'auto (Thermal HAL retains all fan control; no direct cdev write)';
-    } else if (mode === 'manual') {
-        const inputs = [...document.querySelectorAll('#fan-rpm-rows input[data-fan-idx]')];
-        if (inputs.length === 0) {
-            alert("No fan detected. Connect device or start monitoring first.");
-            return;
+        const editor = document.getElementById('thermal-json-editor');
+        if (!thermalJsonPath || !editor?.value.trim()) return alert('Load the active Thermal HAL JSON before applying a temporary fan RPM floor.');
+        let config;
+        try { config = parseThermalJsonText(editor.value).value; }
+        catch (error) { return alert(`Thermal HAL JSON is invalid: ${error.message}`); }
+        if (!thermalJsonLoadedText || JSON.stringify(config) !== thermalJsonLoadedText) return alert('Save or reload the Thermal HAL JSON before using the RPM floor in Verify.');
+        const targets = [];
+        for (const device of halFanDevices) {
+            const input = document.querySelector(`#fan-rpm-rows input[data-hal-cdev="${device.name}"]`);
+            const rpm = Number(input?.value);
+            if (!Number.isFinite(rpm) || rpm < 1) return alert(`Set a positive minimum RPM for ${device.name}.`);
+            const targetFan = halFanTargetFromRpm(device, rpm);
+            if (targetFan.capped && !confirm(`${device.name} can reach approximately ${targetFan.maxRpm} RPM. Apply the maximum available HAL state instead?`)) return;
+            targets.push({ device, rpm, targetFan });
         }
-        const commands = [];
-        const parts = [];
-        for (const input of inputs) {
-            const rpm = parseInt(input.value, 10);
-            if (Number.isNaN(rpm) || rpm < 0) {
-                alert("Fan RPM must be a non-negative number.");
-                return;
-            }
-            const idx = input.dataset.fanIdx;
-            commands.push(`ectool pwmsetfanrpm ${rpm} ${idx}`);
-            parts.push(`F${Number(idx) + 1}=${rpm}`);
-        }
-        cmd = `su 0 sh -c '${commands.join('; ')}; echo FAN_SET_DONE'`;
-        summary = `manual ${parts.join(' / ')} RPM`;
+        if (!targets.length) return alert('No Thermal HAL fan cooling device is available.');
+        try {
+            targets.forEach(({ device, targetFan }) => {
+                config = buildHalFanFloorConfig(config, device.name, targetFan.state);
+            });
+        } catch (error) { return alert(error.message); }
+        return config;
+}
+
+function applyFanSettings() {
+    if (!isDeviceConnected) return alert('Connect device first!');
+    if (fanGovernor() === 'thermal-hal' && document.getElementById('tune-fan-mode')?.value === 'manual') {
+        if (!prepareHalFanFloor()) return;
+        appendConsole('[Fan] RPM floor prepared for Apply & Verify; no device settings changed.');
     } else {
-        cmd = "su 0 sh -c 'ectool autofanctrl; echo FAN_SET_DONE'";
-        summary = 'auto (autofanctrl)';
+        appendConsole('[Fan] Automatic fan control selected.');
     }
-
-    const sendShell = (command) => {
-        if (isLocalTarget(target)) {
-            sendAdb(['shell', command]);
-        } else {
-            sendAdb(['-s', target, 'shell', command]);
-        }
-    };
-
-    sendShell(cmd);
-
-    if (consoleBox) {
-        consoleBox.innerText += `[Tuning] Fan policy applied: ${summary}\n`;
-        consoleBox.innerText += `[Tuning] CMD: ${cmd}\n`;
-        trimConsoleLog(consoleBox);
-        consoleBox.scrollTop = consoleBox.scrollHeight;
-    }
-
-    // Fan needs ~1-2s to spin up to the target; read back after a delay so RPM isn't reported as 0.
-    appendConsole('[Tuning] Reading fan RPM back in 2s (spin-up)...');
-    setTimeout(() => {
-        if (governor === 'thermal-hal') {
-            requestFanInventory(target);
-        } else {
-            sendShell("su 0 sh -c 'echo TPTS_FAN_BEGIN; ectool pwmgetfanrpm 2>&1; ectool temps all 2>&1; echo TPTS_FAN_END'");
-        }
-    }, 2000);
 }
 
 function renderPipelineCountdown() {
@@ -1613,7 +1677,9 @@ function describeFanSetting() {
             const target = Number.isFinite(rpm) ? halFanTargetFromRpm(device, rpm) : null;
             return { name: device.name, rpm: Number.isFinite(rpm) ? rpm : null, state: target?.state ?? null, duty: target?.duty ?? null, max: device.max };
         });
-        return { mode: 'manual', governor, targets, text: `Manual ${targets.map((t) => `${t.rpm ?? '--'} RPM (${t.name} \u2248 ${t.duty ?? '--'}%)`).join(', ')}` };
+        const targetText = targets.map((t) => `${t.name} ${t.rpm ?? '--'} RPM (\u2248 ${t.duty ?? '--'}% duty)`).join(', ');
+        const text = governor === 'thermal-hal' ? `RPM floor ${targetText}` : `Manual ${targetText}`;
+        return { mode: 'manual', governor, targets, text };
     }
     const rpms = [...document.querySelectorAll('#fan-rpm-rows input[data-fan-idx]')].map((input) => parseFloat(input.value)).filter(Number.isFinite);
     return { mode: 'manual', governor, targets: rpms.map((rpm, index) => ({ name: `F${index + 1}`, rpm })), text: `Manual ${rpms.join(' / ')} RPM (EC)` };
@@ -1638,7 +1704,7 @@ function beginVerifyRun(workloads, durationSeconds, source) {
             pl2: Number(document.getElementById('tune-pl2')?.value),
             pl4: Number(document.getElementById('tune-pl4')?.value),
             mmioPl1: latestMmioLimits.pl1,
-            fan: describeFanSetting()
+            fan: source === 'verify' ? describeFanSetting() : { mode: 'auto', governor: fanGovernor(), text: 'Automatic (platform)' }
         },
         samples: []
     };
@@ -1667,9 +1733,14 @@ function finishVerifyRun(aborted = false) {
     if (!verifyRun) return;
     const run = verifyRun;
     verifyRun = null;
+    if (run.fanFloor) {
+        fanFloorRestoring = socket.readyState === 1;
+        sendBackendCommand(['THERMAL_FAN_FLOOR_STOP', run.fanFloor.target, run.fanFloor.path]);
+        appendConsole('[Verify] Restoring the previous Thermal HAL fan configuration.');
+    }
     const verifyEl = document.getElementById('verify-status');
     const report = buildVerifyReport(run, aborted);
-    if (verifyEl) verifyEl.innerText = aborted ? 'stopped' : report.verdict;
+    if (verifyEl) verifyEl.innerText = fanFloorRestoring ? 'restoring fan...' : aborted ? 'stopped' : report.verdict;
     renderVerifyResult(run, report, aborted);
     appendConsole(`[Verify] ${aborted ? 'Stopped. ' : ''}${report.lines.map((item) => item.text).join(' | ')}`);
 }
@@ -1782,16 +1853,48 @@ function renderVerifyResult(run, report, aborted) {
 
 function applyAndVerify() {
     if (!isDeviceConnected) return alert('Connect device first!');
+    if (pendingFanFloorVerify) return;
+    if (fanFloorRestoring) return alert('Wait for the previous fan configuration to be restored.');
     if (isPipelineRunning) {
         if (verifyRun?.source === 'verify') return startThermalPipeline();
         return alert('A test is already running. Stop it on the Stress page first.');
     }
-    const duration = Math.max(30, parseInt(document.getElementById('verify-duration')?.value, 10) || 60);
+    if (thermalJsonLoading || thermalJsonApplying) return alert('Wait for the Thermal HAL configuration operation to finish.');
+    if (!latestTelemetryAt || Date.now() - latestTelemetryAt > 5000) {
+        startLiveTelemetryLoop();
+        return alert('Waiting for live telemetry. Please start Verify again when live data is available.');
+    }
+    const duration = Number(document.getElementById('verify-duration')?.value);
+    if (!Number.isInteger(duration) || duration < 30 || duration > 3600) return alert('Verify duration must be between 30 and 3600 seconds.');
     const selected = getSelectedWorkloads().filter((workload) => workload !== 'geekbench');
     const workloads = selected.length ? selected : ['stressapptest'];
+    const fishCount = document.getElementById('aquarium-fish-count')?.value || '30000';
+    if (workloads.includes('aquarium') && (!/^\d+$/.test(fishCount) || Number(fishCount) < 1)) return alert('Fish count must be a positive integer.');
+    const useFanFloor = fanGovernor() === 'thermal-hal' && document.getElementById('tune-fan-mode')?.value === 'manual';
+    const fanConfig = useFanFloor ? prepareHalFanFloor() : null;
+    if (useFanFloor && !fanConfig) return;
     if (applyPowerLimits() !== true) return;
     const verifyEl = document.getElementById('verify-status');
     if (verifyEl) verifyEl.innerText = 'applying...';
+    if (useFanFloor) {
+        if (socket.readyState !== 1) return alert('Backend connection is unavailable.');
+        const target = connectedDeviceTarget;
+        const path = thermalJsonPath;
+        const button = document.getElementById('verify-start-button');
+        if (button) button.disabled = true;
+        const pending = { target, path, duration, workloads, timer: null };
+        pendingFanFloorVerify = pending;
+        pending.timer = setTimeout(() => {
+            if (pendingFanFloorVerify !== pending) return;
+            pendingFanFloorVerify = null;
+            if (button) button.disabled = false;
+            if (verifyEl) verifyEl.innerText = 'fan floor timed out';
+            sendBackendCommand(['THERMAL_FAN_FLOOR_STOP', target, path]);
+            appendConsole('[Verify] Fan floor confirmation timed out; test not started.');
+        }, 45000);
+        sendBackendCommand(['THERMAL_FAN_FLOOR_START', target, path, String(duration + 120)], JSON.stringify(fanConfig));
+        return;
+    }
     // Let the MSR/MMIO writes land and echo back before the workload starts.
     setTimeout(() => startThermalPipeline({ workloads, durationSeconds: duration, source: 'verify' }), 1500);
 }
@@ -2324,7 +2427,10 @@ function startThermalPipeline(options = {}) {
         restoreAllUiToIdle();
         return alert('Fish count must be a positive integer.');
     }
-    if (!geekbenchMode && !autoTuneDryRun) beginVerifyRun(workloads, Number(sec), options.source || 'stress');
+    if (!geekbenchMode && !autoTuneDryRun) {
+        beginVerifyRun(workloads, Number(sec), options.source || 'stress');
+        if (verifyRun && options.fanFloor) verifyRun.fanFloor = options.fanFloor;
+    }
     if (options.source === 'verify') {
         const verifyButton = document.getElementById('verify-start-button');
         if (verifyButton) {
@@ -2399,6 +2505,60 @@ function findFanCoolingDevice(config) {
         limitInfo: Array.isArray(binding?.LimitInfo) ? binding.LimitInfo.slice() : [0, 1, 2, 3, 4, 5, 6],
         verifiedFromDefault: Boolean(binding)
     };
+}
+
+function buildHalFanFloorConfig(config, deviceName, state) {
+    const updated = JSON.parse(JSON.stringify(config));
+    const sensors = Array.isArray(updated.Sensors)
+        ? updated.Sensors
+        : Object.values(updated.Sensors || {});
+    const sourceSensor = sensors.find((sensor) =>
+        sensor?.Name && !sensor.Name.startsWith('VIRTUAL-TPTS-FAN-FLOOR-')
+        && !sensor.isDisabled && Array.isArray(sensor.BindedCdevInfo)
+        && sensor.BindedCdevInfo.some((binding) => binding?.CdevRequest === deviceName)
+    );
+    if (!sourceSensor) throw new Error(`No Thermal HAL sensor is bound to ${deviceName}.`);
+    if (!Number.isInteger(state) || state < 1) throw new Error('Fan floor state must be a positive integer.');
+
+    const floorName = `VIRTUAL-TPTS-FAN-FLOOR-${deviceName}`;
+    const floorSensor = {
+        Name: floorName,
+        Type: 'UNKNOWN',
+        SendCallback: false,
+        SendPowerHint: false,
+        VirtualSensor: true,
+        Formula: 'MAXIMUM',
+        Combination: [sourceSensor.Name],
+        Coefficient: [1],
+        Multiplier: Number.isFinite(sourceSensor.Multiplier) ? sourceSensor.Multiplier : 1,
+        PollingDelay: 1000,
+        PassiveDelay: 1000,
+        HotThreshold: ['NaN', 1, 'NaN', 'NaN', 'NaN', 'NaN', 'NaN'],
+        HotHysteresis: [0, 0, 0, 0, 0, 0, 0],
+        BindedCdevInfo: [{
+            CdevRequest: deviceName,
+            LimitInfo: [0, state, state, state, state, state, state]
+        }]
+    };
+
+    if (Array.isArray(updated.Sensors)) {
+        updated.Sensors = updated.Sensors.filter((sensor) => sensor?.Name !== floorName);
+        updated.Sensors.push(floorSensor);
+    } else {
+        updated.Sensors = Object.fromEntries(Object.entries(updated.Sensors || {}).filter(([, sensor]) => sensor?.Name !== floorName));
+        updated.Sensors[floorName] = floorSensor;
+    }
+    return updated;
+}
+
+function removeTemporaryHalFanFloors(config) {
+    const isTemporaryFloor = (sensor) => typeof sensor?.Name === 'string' && sensor.Name.startsWith('VIRTUAL-TPTS-FAN-FLOOR-');
+    if (Array.isArray(config.Sensors)) {
+        config.Sensors = config.Sensors.filter((sensor) => !isTemporaryFloor(sensor));
+    } else if (config.Sensors && typeof config.Sensors === 'object') {
+        config.Sensors = Object.fromEntries(Object.entries(config.Sensors).filter(([, sensor]) => !isTemporaryFloor(sensor)));
+    }
+    return config;
 }
 
 function buildFanCoolingOverlay(config, thresholds) {

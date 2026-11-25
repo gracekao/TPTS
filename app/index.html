@@ -277,21 +277,21 @@
                         <h4>♨ Fan Control <span class="current-hint" id="fan-count-hint" style="margin-left:auto">--</span></h4>
                         <div class="fan-controls"><div class="form-group"><label>Control Mode</label><select id="tune-fan-mode" onchange="toggleFanInput()"><option value="auto">Automatic (EC autofanctrl)</option><option value="manual">Manual RPM</option></select></div></div>
                         <p class="section-sub" id="fan-auto-hint">The EC controls fan speed. Switch to Manual RPM to set a fixed speed.</p>
+                        <p class="section-sub" id="fan-floor-hint" hidden>Apply &amp; Verify uses this minimum cooling vote for the Verify duration, then restores the previous Thermal HAL configuration. HAL may request more cooling.</p>
                         <div class="fan-rpm-rows" id="fan-rpm-rows" hidden></div>
-                        <div class="action-row"><button class="primary-button" onclick="applyFanSettings()">Apply Fan Settings</button></div>
+                    </div>
+                    <div class="section" id="tab-thermal-json">
+                        <h4>🧩 Thermal HAL JSON</h4>
+                        <p class="section-sub">Edit the Thermal HAL automatic fan curve and cooling-state votes in <code>thermal_info_config.json</code>. Load the active file before applying a temporary RPM floor.</p>
+                        <button class="primary-button" onclick="openThermalJsonEditor(true)">Load from Device &amp; Edit</button>
+                        <button class="secondary-button" onclick="openThermalJsonEditor(false)">Open Editor Only</button>
+                        <div class="thermal-json-status" id="thermal-json-status"></div>
                     </div>
                     <div class="section" id="tab-verify">
                         <h4>✔ Verify <span class="current-hint" id="verify-status" style="margin-left:auto">--</span></h4>
                         <p class="section-sub">Applies the power limits above, runs the workload selected on the Stress page, then shows a <b>Run Result</b> comparing applied vs. observed values. PL1 only engages after its ~30–45 s time window, so keep at least 60 s. Thermal HAL Manual RPM is a minimum fan floor; HAL can always request more cooling.</p>
                         <div class="form-group"><label for="verify-duration">Duration</label><div class="unit-field"><input type="number" id="verify-duration" value="60" min="30" max="3600"><span class="unit">sec</span></div></div>
                         <div class="action-row"><button class="success-button" id="verify-start-button" onclick="applyAndVerify()">Apply &amp; Verify</button></div>
-                    </div>
-                    <div class="section" id="tab-thermal-json">
-                        <h4>🧩 Thermal HAL JSON</h4>
-                        <p class="section-sub">View or edit <code>thermal_info_config.json</code> on the device. A backup is kept for Restore Default.</p>
-                        <button class="primary-button" onclick="openThermalJsonEditor(true)">Load from Device &amp; Edit</button>
-                        <button class="secondary-button" onclick="openThermalJsonEditor(false)">Open Editor Only</button>
-                        <div class="thermal-json-status" id="thermal-json-status"></div>
                     </div>
                 </div>
                 <div id="sidebar-autotune" class="sidebar-tab-content" role="tabpanel" hidden>
